@@ -1,0 +1,286 @@
+from datetime import datetime, date
+from decimal import Decimal
+from sqlalchemy import String, Integer, Float, ForeignKey, DateTime, Text, Date, Numeric, UniqueConstraint, CheckConstraint, func
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from .database import LocalBase, RdsBase
+
+
+class Plant(LocalBase):
+    __tablename__ = "plants"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+
+
+class Floor(LocalBase):
+    __tablename__ = "floors"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    plant_id: Mapped[str] = mapped_column(String(64), ForeignKey("plants.id"))
+    name: Mapped[str] = mapped_column(String(255), unique=True)
+
+
+class Machine(LocalBase):
+    __tablename__ = "machines"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    code: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(255))
+    location: Mapped[str] = mapped_column(String(255))
+    plant_id: Mapped[str] = mapped_column(String(64), ForeignKey("plants.id"))
+    floor_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("floors.id"), nullable=True)
+    rated_kw: Mapped[float] = mapped_column(Float, default=0.0)
+    load_factor: Mapped[float] = mapped_column(Float, default=0.7)
+    load_factor_source: Mapped[str] = mapped_column(String(32), default="ASSUMED")
+    criticality: Mapped[str] = mapped_column(String(8), default="C")
+    expected_run_hours: Mapped[float] = mapped_column(Float, default=8.0)
+    current_status: Mapped[str] = mapped_column(String(16), default="IDLE")
+    machine_type: Mapped[str] = mapped_column(String(32), default="OTHER")
+    category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    building: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    sub_location: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    company: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    model_no: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    serial_no: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    quantity: Mapped[int] = mapped_column(Integer, default=1)
+    rated_amps: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class User(LocalBase):
+    __tablename__ = "users"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(255))
+    password_hash: Mapped[str] = mapped_column(String(255))
+    role: Mapped[str] = mapped_column(String(32))
+    plant_id: Mapped[str] = mapped_column(String(64), ForeignKey("plants.id"))
+
+
+class UserMachineAssignment(LocalBase):
+    __tablename__ = "user_machine_assignments"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), ForeignKey("users.id"))
+    machine_id: Mapped[str] = mapped_column(String(64), ForeignKey("machines.id"))
+
+
+# NOTE: the old `mt_machine_runs` table / ProductionRun model was retired on
+# 2026-06-25 — production runs now live directly in `mt_machine_daily_kwh`
+# (one row per run; see MachineDailyKwh). The table can be dropped in RDS.
+
+# NOTE: the old `breakdown_flags` table / BreakdownFlag model was retired on
+# 2026-06-23 — operator breakdown flags now live in `mt_breakdown_records`
+# (BreakdownRecord, source='OPERATOR_FLAG'). The table can be dropped in RDS.
+
+
+class MtAsset(RdsBase):
+    """Factory asset register for buildings W-202 and A-185.
+
+    Loaded from 'Asset Full revised A185 & W202.xlsx' (both sheets, unioned).
+    Replaces the old `mt_machine_list` table. Source of truth for the asset list.
+    """
+    __tablename__ = "mt_asset_list"
+
+    id:                  Mapped[int]            = mapped_column(Integer, primary_key=True, autoincrement=True)
+    asset_id:            Mapped[str | None]     = mapped_column(String(32), unique=True, nullable=True)
+    building:            Mapped[str]            = mapped_column(String(16), index=True)
+    asset_name:          Mapped[str]            = mapped_column(String(255))
+    category:            Mapped[str | None]     = mapped_column(String(64), index=True, nullable=True)
+    sub_location:        Mapped[str | None]     = mapped_column(String(255), nullable=True)
+    quantity:            Mapped[int | None]     = mapped_column(Integer, nullable=True)
+    revised_count_2026:  Mapped[int | None]     = mapped_column(Integer, nullable=True)
+    model_no:            Mapped[str | None]     = mapped_column(String(255), nullable=True)
+    serial_no:           Mapped[str | None]     = mapped_column(String(255), nullable=True)
+    power_load:          Mapped[str | None]     = mapped_column(String(128), nullable=True)
+    purchase_date:       Mapped[date | None]    = mapped_column(Date, nullable=True)
+    purchase_value:      Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    condition:           Mapped[str | None]     = mapped_column(String(32), nullable=True)
+    assigned_to:         Mapped[str | None]     = mapped_column(String(128), nullable=True)
+    warranty_amc_expiry: Mapped[str | None]     = mapped_column(String(64), nullable=True)
+    remarks:             Mapped[str | None]     = mapped_column(Text, nullable=True)
+
+
+class FloorUtilityReading(LocalBase):
+    """Daily KWH meter reading per floor (from 'Floorwise utility dada.xlsx')."""
+    __tablename__ = "floor_utility_readings"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    floor_id: Mapped[str] = mapped_column(String(64), ForeignKey("floors.id"), index=True)
+    reading_date: Mapped[datetime] = mapped_column(Date, index=True)
+    meter_reading: Mapped[float | None] = mapped_column(Float, nullable=True)
+    daily_kwh: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class MachineDailyKwh(RdsBase):
+    """One production run per row — also the per-machine energy record.
+
+    Replaces the old `mt_machine_runs` table (retired 2026-06-25): when an
+    operator starts a machine a row is inserted (status='RUNNING', started_at,
+    operator); on stop the backend fills ended_at + daily_kwh and flips status to
+    'COMPLETE'. A machine started/stopped N times in a day = N rows (the old
+    UNIQUE(machine_id, reading_date) constraint is therefore GONE).
+
+    `daily_kwh` is computed backend-side from the asset's rated power
+    (mt_asset_list.power_load × run hours × power_factor); it is NULL while the
+    run is still RUNNING. building/floor are a denormalized snapshot from the
+    asset register. Distinct from the floor meter readings (FloorUtilityReading /
+    mt_floor_utility_readings), which are *real* per-floor meter readings."""
+    __tablename__ = "mt_machine_daily_kwh"
+
+    id:            Mapped[int]             = mapped_column(Integer, primary_key=True, autoincrement=True)
+    machine_id:    Mapped[str]             = mapped_column(String(64), index=True)  # = mt_asset_list.asset_id
+    reading_date:  Mapped[date]            = mapped_column(Date, index=True)        # = started_at calendar day
+    building:      Mapped[str]             = mapped_column(String(16), default="W-202", server_default="W-202")
+    floor:         Mapped[str | None]      = mapped_column(String(64), nullable=True)
+    # --- run / lifecycle (folded in from the retired mt_machine_runs) ---
+    client_run_id: Mapped[str | None]      = mapped_column(String(64), index=True, nullable=True)  # idempotency key from the app
+    operator_id:   Mapped[str | None]      = mapped_column(String(64), index=True, nullable=True)  # = str(mt_users.id)
+    operator_name: Mapped[str | None]      = mapped_column(String(128), nullable=True)             # denormalized snapshot
+    started_at:    Mapped[datetime | None] = mapped_column(DateTime, index=True, nullable=True)
+    ended_at:      Mapped[datetime | None] = mapped_column(DateTime, nullable=True)                 # NULL while RUNNING
+    status:        Mapped[str]             = mapped_column(String(16), default="RUNNING", server_default="RUNNING")  # RUNNING | COMPLETE
+    daily_kwh:     Mapped[Decimal | None]  = mapped_column(Numeric(14, 4), nullable=True)           # NULL while RUNNING
+    source:        Mapped[str]             = mapped_column(String(16), default="RUN", server_default="RUN")
+    created_at:    Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())
+    updated_at:    Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())
+
+
+class MtFloorUtilityReading(RdsBase):
+    """Per-floor daily energy reading (RDS, pgAdmin-visible). Each row pairs the
+    technician's ACTUAL physical meter reading (`meter_reading`) with the
+    SYSTEM-generated reading (`daily_kwh` — the day's total run kWh on that floor,
+    summed from mt_machine_daily_kwh). Filled via the technician's "Daily Reading"
+    screen (GET /floor-readings/system + POST /floor-readings).
+
+    NOT the same as the SQLite `FloorUtilityReading` (floor_utility_readings),
+    which is the legacy dev table. `floor` here = mt_asset_list.sub_location (so it
+    aligns with mt_machine_daily_kwh.floor for the system total)."""
+    __tablename__ = "mt_floor_utility_readings"
+
+    id:            Mapped[int]            = mapped_column(Integer, primary_key=True, autoincrement=True)
+    building:      Mapped[str]            = mapped_column(String(16), default="W-202", server_default="W-202")
+    floor:         Mapped[str]            = mapped_column(String(64), index=True)
+    reading_date:  Mapped[date]           = mapped_column(Date, index=True)
+    meter_reading: Mapped[Decimal | None] = mapped_column(Numeric(14, 4), nullable=True)  # actual physical meter
+    daily_kwh:     Mapped[Decimal | None] = mapped_column(Numeric(14, 4), nullable=True)  # system-generated reading
+
+    __table_args__ = (
+        UniqueConstraint("building", "floor", "reading_date", name="uq_mt_floor_utility"),
+    )
+
+
+class MtUser(RdsBase):
+    """Maintenance-app users (operators / technicians / heads). Lives in RDS so
+    they're managed in pgAdmin. No password column yet — all users share a fixed
+    password for now (handled in auth)."""
+    __tablename__ = "mt_users"
+
+    id:         Mapped[int]             = mapped_column(Integer, primary_key=True, autoincrement=True)
+    emp_id:     Mapped[str | None]      = mapped_column(String(20), nullable=True)
+    name:       Mapped[str]             = mapped_column(String(255))
+    location:   Mapped[str | None]      = mapped_column(String(100), nullable=True)
+    contact_no: Mapped[str | None]      = mapped_column(String(15), nullable=True)
+    email_id:   Mapped[str | None]      = mapped_column(String(255), nullable=True)
+    role:       Mapped[str | None]      = mapped_column(String(50), nullable=True)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    username:   Mapped[str]             = mapped_column(String, unique=True, index=True)
+
+    @property
+    def plant_id(self) -> str:
+        return (self.location or "UNKNOWN").strip()
+
+    @property
+    def norm_role(self) -> str:
+        """'operator ' -> 'OPERATOR', 'Technician' -> 'TECHNICIAN', 'Head' -> 'HEAD'."""
+        return (self.role or "").strip().upper() or "OPERATOR"
+
+
+class PreventiveMaintenanceDoc(RdsBase):
+    """PM checklist submissions, stored in the user's existing
+    `doc_preventive_maintenance` table — WITHOUT changing its schema. The full
+    submission (header fields + items[]) goes into the existing `rows` JSONB
+    column; the existing scalar columns (month/checked_by/verified_by/created_by)
+    are populated for compatibility."""
+    __tablename__ = "doc_preventive_maintenance"
+
+    id:          Mapped[int]            = mapped_column(Integer, primary_key=True, autoincrement=True)
+    month:       Mapped[str | None]     = mapped_column(String(7), nullable=True)
+    checked_by:  Mapped[str | None]     = mapped_column(String(128), nullable=True)
+    verified_by: Mapped[str | None]     = mapped_column(String(128), nullable=True)
+    rows:        Mapped[dict]           = mapped_column(JSONB, nullable=False)
+    warehouse:   Mapped[str | None]     = mapped_column(String(16), nullable=True)
+    created_by:  Mapped[str | None]     = mapped_column(String(128), nullable=True)
+    created_at:  Mapped[datetime]       = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class MachineTransfer(RdsBase):
+    """One machine-transfer record (between warehouses) with an optional proof
+    photo stored in S3 (`proof_photo_url`)."""
+    __tablename__ = "doc_machine_transfer"
+
+    id:                Mapped[int]            = mapped_column(Integer, primary_key=True, autoincrement=True)
+    transfer_date:     Mapped[date | None]    = mapped_column(Date, nullable=True)
+    from_warehouse:    Mapped[str]            = mapped_column(String(32), index=True)
+    to_warehouse:      Mapped[str]            = mapped_column(String(32), index=True)
+    machine_name:      Mapped[str]            = mapped_column(String(255))
+    machine_code:      Mapped[str | None]     = mapped_column(String(128), nullable=True)
+    condition:         Mapped[str | None]     = mapped_column(String(64), nullable=True)
+    reason:            Mapped[str | None]     = mapped_column(Text, nullable=True)
+    authorised_person: Mapped[str | None]     = mapped_column(String(255), nullable=True)
+    remarks:           Mapped[str | None]     = mapped_column(Text, nullable=True)
+    proof_photo_url:   Mapped[str | None]     = mapped_column(Text, nullable=True)
+    created_by:        Mapped[str | None]     = mapped_column(String(128), nullable=True)
+    created_at:        Mapped[datetime]       = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class BreakdownRecord(RdsBase):
+    """One live breakdown event: operator raises -> technician acknowledges &
+    repairs -> QC approves/rejects. People are stored as names (resolved from
+    mt_users at write time). The machine is usable again only when status=CLOSED."""
+    __tablename__ = "mt_breakdown_records"
+
+    id:                     Mapped[int]             = mapped_column(Integer, primary_key=True, autoincrement=True)
+    machine_id:             Mapped[str | None]      = mapped_column(String(64), index=True, nullable=True)   # = mt_asset_list.asset_id
+    machine_name:           Mapped[str | None]      = mapped_column(String(255), nullable=True)
+    operator_raise_person:  Mapped[str | None]      = mapped_column(String(128), nullable=True)
+    start_time:             Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    description:            Mapped[str | None]      = mapped_column(Text, nullable=True)
+    severity:               Mapped[str | None]      = mapped_column(String(16), nullable=True)               # CRITICAL|MAJOR|MINOR
+    before_photo_url:       Mapped[str | None]      = mapped_column(Text, nullable=True)
+    # OPEN | ACKNOWLEDGED | PENDING_QC | CLOSED | REOPENED (machine usable only when CLOSED)
+    status:                 Mapped[str | None]      = mapped_column(String(16), index=True, nullable=True)
+    technician:             Mapped[str | None]      = mapped_column(String(128), nullable=True)
+    ackn_at:                Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    work_done_des:          Mapped[str | None]      = mapped_column(Text, nullable=True)
+    photo_url:              Mapped[str | None]      = mapped_column(Text, nullable=True)
+    qc_checked_by:          Mapped[str | None]      = mapped_column(String(128), nullable=True)
+    qc_status:              Mapped[str | None]      = mapped_column(String(16), nullable=True)               # PENDING|APPROVED|REJECTED
+    qc_reject_reason:       Mapped[str | None]      = mapped_column(Text, nullable=True)
+    end_time:               Mapped[datetime | None] = mapped_column(DateTime, nullable=True)                 # set when QC approves
+    created_at:             Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())
+    updated_at:             Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())
+
+
+class BreakdownDoc(RdsBase):
+    """One row of a submitted CFPLA.C4.F.06 breakdown-maintenance sheet. Moved out
+    of mt_breakdown_records (which is now the live-workflow table only)."""
+    __tablename__ = "mt_doc_breakdown"
+
+    id:                      Mapped[int]          = mapped_column(Integer, primary_key=True, autoincrement=True)
+    doc_no:                  Mapped[str]          = mapped_column(String(32), nullable=False, default="CFPLA.C4.F.06")
+    sr_no:                   Mapped[int | None]   = mapped_column(Integer, nullable=True)
+    record_date:             Mapped[date | None]  = mapped_column(Date, nullable=True)
+    location:                Mapped[str | None]   = mapped_column(String(128), nullable=True)
+    machine_name:            Mapped[str | None]   = mapped_column(String(128), nullable=True)
+    equipment_model_no:      Mapped[str | None]   = mapped_column(String(128), nullable=True)
+    problem_in_brief:        Mapped[str | None]   = mapped_column(Text, nullable=True)
+    type_of_maintenance:     Mapped[str | None]   = mapped_column(String(32), nullable=True)
+    part_of_machine:         Mapped[str | None]   = mapped_column(String(128), nullable=True)
+    temporary_reason:        Mapped[str | None]   = mapped_column(Text, nullable=True)
+    duration_start:          Mapped[str | None]   = mapped_column(String(32), nullable=True)
+    duration_end:            Mapped[str | None]   = mapped_column(String(32), nullable=True)
+    machine_operator_sign:   Mapped[str | None]   = mapped_column(String(128), nullable=True)
+    maintenance_person_sign: Mapped[str | None]   = mapped_column(String(128), nullable=True)
+    qc_clearance_sign:       Mapped[str | None]   = mapped_column(String(128), nullable=True)
+    verified_by:             Mapped[str | None]   = mapped_column(String(128), nullable=True)
+    created_by:              Mapped[str | None]   = mapped_column(String(128), nullable=True)
+    created_at:              Mapped[datetime]     = mapped_column(DateTime, default=datetime.utcnow)

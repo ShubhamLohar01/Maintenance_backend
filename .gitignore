@@ -1,0 +1,46 @@
+# Secrets — NEVER commit
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local SQLite DB (regeneratable from scripts/seed.py)
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Operational data / exports — NOT source code, kept out of the repo.
+# (asset lists, power-load & assigned-to backups, PDF/Excel sources, SQL data dumps)
+*.csv
+*.xlsx
+*.xls
+*.pdf
+# Root-level SQL data dumps only — schema migrations under migrations/ are kept.
+/*.sql
