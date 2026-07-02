@@ -603,3 +603,19 @@ class OpenBreakdownDto(BaseModel):
     qc_decided_at: Optional[int] = None      # QC approved or disapproved
     building: Optional[str] = None
     qc_reject_reason: Optional[str] = None  # why QC sent it back (null unless re-opened by a disapprove)
+
+
+# --- Device push-token registration (P2 FCM push scaffolding) ---
+
+class DeviceTokenRequest(_Trimmed):
+    """Register/refresh this device's FCM token. `user_id` is an optional hint —
+    it defaults to the authenticated caller. Upserted on `token`."""
+    user_id: str = ""
+    token: str
+    platform: str = "android"
+
+
+class DeviceTokenResponse(BaseModel):
+    id: int
+    user_id: str
+    platform: str

@@ -290,3 +290,18 @@ class BreakdownDoc(RdsBase):
     verified_by:             Mapped[str | None]   = mapped_column(String(128), nullable=True)
     created_by:              Mapped[str | None]   = mapped_column(String(128), nullable=True)
     created_at:              Mapped[datetime]     = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class MtDeviceToken(RdsBase):
+    """One registered device push token (FCM), used by the P2 push fan-out. Upserted
+    on `token` (unique) so a device that re-registers updates in place; a single user
+    may have several devices. `user_id` = str(mt_users.id). Nothing is sent while
+    settings.fcm_enabled is false — this table just accumulates tokens meanwhile."""
+    __tablename__ = "mt_device_tokens"
+
+    id:         Mapped[int]      = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id:    Mapped[str]      = mapped_column(String(64), index=True)                 # = str(mt_users.id)
+    token:      Mapped[str]      = mapped_column(String(255), unique=True, index=True)
+    platform:   Mapped[str]      = mapped_column(String(16), default="android", server_default="android")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

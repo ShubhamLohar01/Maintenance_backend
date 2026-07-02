@@ -28,5 +28,13 @@ class Settings(BaseSettings):
     aws_region: str = "ap-south-1"
     aws_s3_bucket_name: str = ""
 
+    # --- FCM push (P2) — flag-gated scaffolding, OFF until we move off polling. ---
+    # While false, /devices/token still stores tokens but the fan-out never sends
+    # (the app polls and computes reminders locally; live push would double-notify).
+    fcm_enabled: bool = False
+    # Path to the Firebase service-account JSON (same project the Android app uses).
+    # Only read when fcm_enabled is true; sending is a no-op otherwise.
+    fcm_credentials_file: str = ""
+
 
 settings = Settings()
