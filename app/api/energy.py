@@ -12,7 +12,7 @@ from ..schemas import (
     DailyHistoryDto, DailyRunDto, ActiveRunDto,
 )
 from ..auth import get_current_user
-from ..utils import to_epoch_ms, from_epoch_ms, parse_kw
+from ..utils import to_epoch_ms, from_epoch_ms, parse_kw, is_shut_down
 from ..config import settings
 
 router = APIRouter(prefix="/energy", tags=["energy"])
@@ -119,6 +119,8 @@ def start_run(
     asset = db.query(MtAsset).filter(MtAsset.asset_id == req.machine_id).first()
     if asset is None:
         raise HTTPException(status_code=404, detail="Asset not found in mt_asset_list")
+    if is_shut_down(asset.condition):
+        raise HTTPException(status_code=409, detail="Machine is shut down")
 
     existing = (
         db.query(MachineDailyKwh)

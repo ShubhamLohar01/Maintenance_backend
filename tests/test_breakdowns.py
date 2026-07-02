@@ -301,6 +301,21 @@ def test_qc_pickup_keeps_pending_qc_and_preserves_ackn(auth_client, db_session):
     assert rec.qc_checked_by == "qc.user"
 
 
+def test_flag_rejected_on_shut_down_asset(auth_client, db_session):
+    """A breakdown can't be raised on a machine marked "Shut Down" (matched
+    case-insensitively / trimmed) — server-side defense-in-depth."""
+    _seed(db_session)
+    a = db_session.query(MtAsset).filter(MtAsset.asset_id == "W202-0005").one()
+    a.condition = " shut down "     # trimmed + case-insensitive still matches
+    db_session.commit()
+    r = auth_client.post("/breakdowns/flag", data={
+        "machine_id": "W202-0005", "operator_id": "42", "severity": "MAJOR",
+        "description": "x", "raised_at": NOW})
+    assert r.status_code == 409, r.text
+    assert "shut down" in r.json()["detail"].lower()
+    assert db_session.query(BreakdownRecord).count() == 0    # no ticket created
+
+
 def test_qc_approve_stamps_qc_decided_at(auth_client, db_session):
     _seed(db_session)
     fid = _flag(auth_client)

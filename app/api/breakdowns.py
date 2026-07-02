@@ -11,7 +11,7 @@ from ..schemas import (
 )
 from ..auth import get_current_user
 from ..storage import upload_bytes, image_ext_for
-from ..utils import to_epoch_ms, from_epoch_ms, norm_plant, building_for, ALL_BUILDINGS
+from ..utils import to_epoch_ms, from_epoch_ms, norm_plant, building_for, ALL_BUILDINGS, is_shut_down
 
 router = APIRouter(tags=["breakdowns"])
 
@@ -91,6 +91,8 @@ async def raise_flag(
     asset = db.query(MtAsset).filter(MtAsset.asset_id == machine_id).first()
     if asset is None:
         raise HTTPException(status_code=404, detail="Asset not found in mt_asset_list")
+    if is_shut_down(asset.condition):
+        raise HTTPException(status_code=409, detail="Machine is shut down")
 
     operator_name = _resolve_name(db, operator_id) or user.name
     rec = BreakdownRecord(

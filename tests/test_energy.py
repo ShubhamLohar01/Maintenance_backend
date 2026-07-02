@@ -93,5 +93,21 @@ def test_close_stale_endpoint(auth_client, db_session):
     assert db_session.query(MachineDailyKwh).one().status == "COMPLETE"
 
 
+def test_run_start_rejected_on_shut_down_asset(auth_client, db_session):
+    """Server-side defense-in-depth: production must not start on a machine the
+    supervisor marked "Shut Down" (condition sentinel), even via a direct API call."""
+    db_session.add(MtAsset(
+        asset_id="A185-9", building="A-185", asset_name="Sealer",
+        power_load="5kw", condition="Shut Down"))
+    db_session.commit()
+
+    resp = auth_client.post("/energy/runs/start", json={
+        "machine_id": "A185-9", "started_at": _ms(datetime.utcnow()),
+        "client_run_id": "c-1", "scheduled_end_at": _ms(datetime.utcnow()) + 3_600_000})
+    assert resp.status_code == 409, resp.text
+    assert "shut down" in resp.json()["detail"].lower()
+    assert db_session.query(MachineDailyKwh).count() == 0    # no run row created
+
+
 def test_active_runs_requires_auth_401(client):
     assert client.get("/energy/runs/active").status_code == 401
