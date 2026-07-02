@@ -594,6 +594,12 @@ class OpenBreakdownDto(BaseModel):
     severity: Optional[str] = None
     description: str = ""
     status: str
-    reported_at: Optional[int] = None     # epoch ms
+    reported_at: Optional[int] = None       # epoch ms
+    # Lifecycle transition times (epoch ms, null until they happen) — the app times
+    # its reminder escalations off these; same clock/units as reported_at.
+    acknowledged_at: Optional[int] = None    # technician acknowledged
+    resolved_at: Optional[int] = None        # technician finished the repair (work-done)
+    qc_acknowledged_at: Optional[int] = None # QC picked up the awaiting-QC ticket
+    qc_decided_at: Optional[int] = None      # QC approved or disapproved
     building: Optional[str] = None
     qc_reject_reason: Optional[str] = None  # why QC sent it back (null unless re-opened by a disapprove)

@@ -121,14 +121,19 @@ def acknowledge(
     db: Session = Depends(get_rds),
     user: MtUser = Depends(get_current_user),
 ):
-    """Technician acknowledges the breakdown -> ACKNOWLEDGED."""
+    """Dual-purpose. Technician acknowledges the breakdown -> ACKNOWLEDGED (ackn_at).
+    QC 'pickup' of an awaiting-QC ticket sends `qc_checked_by`: that path only stamps
+    qc_acknowledged_at + qc_checked_by and DOES NOT change status or ackn_at — the
+    ticket stays PENDING_QC through QC review (the old flip back to ACKNOWLEDGED,
+    which also clobbered the technician's ackn_at, was a bug)."""
     rec = _get_rec(db, rec_id)
-    rec.status = "ACKNOWLEDGED"
-    rec.technician = req.user_name or _resolve_name(db, req.user_id) or user.name
-    rec.ackn_at = _ms_to_naive(req.acknowledged_at)
-    # QC pickup sends its login username; technician/older builds omit it -> leave as-is.
     if req.qc_checked_by:
         rec.qc_checked_by = req.qc_checked_by
+        rec.qc_acknowledged_at = _ms_to_naive(req.acknowledged_at)
+    else:
+        rec.status = "ACKNOWLEDGED"
+        rec.technician = req.user_name or _resolve_name(db, req.user_id) or user.name
+        rec.ackn_at = _ms_to_naive(req.acknowledged_at)
     db.commit()
     return QcUpdateResponse(
         id=str(rec.id), ticket_status=rec.status,
@@ -156,6 +161,7 @@ async def work_done(
     rec = _get_rec(db, rec_id)
     rec.status = "PENDING_QC"
     rec.qc_status = "PENDING"
+    rec.resolved_at = _ms_to_naive(done_at)           # repair finished (was discarded)
     rec.work_done_des = (work_done or "").strip() or None
     if not rec.technician:
         rec.technician = user_name or _resolve_name(db, user_id) or user.name
@@ -185,6 +191,7 @@ def qc_approve(
     rec.qc_status = "APPROVED"
     rec.qc_checked_by = req.user_name or _resolve_name(db, req.user_id) or user.name
     rec.end_time = _ms_to_naive(req.decided_at) if req.decided_at else now
+    rec.qc_decided_at = _ms_to_naive(req.decided_at) if req.decided_at else now
     if req.after_photo_path and not rec.photo_url:
         rec.photo_url = req.after_photo_path
     db.commit()
@@ -209,6 +216,7 @@ def qc_disapprove(
     rec.qc_status = "DISAPPROVED"
     rec.qc_checked_by = req.user_name or _resolve_name(db, req.user_id) or user.name
     rec.qc_reject_reason = req.reason or req.notes or None
+    rec.qc_decided_at = _ms_to_naive(req.decided_at) if req.decided_at else datetime.utcnow()
     db.commit()
     return QcUpdateResponse(
         id=str(rec.id), ticket_status=rec.status,
@@ -262,6 +270,10 @@ def list_open_breakdowns(
             description=r.description or "",
             status=r.status or "OPEN",
             reported_at=to_epoch_ms(r.start_time),
+            acknowledged_at=to_epoch_ms(r.ackn_at),
+            resolved_at=to_epoch_ms(r.resolved_at),
+            qc_acknowledged_at=to_epoch_ms(r.qc_acknowledged_at),
+            qc_decided_at=to_epoch_ms(r.qc_decided_at),
             building=asset.building,
             qc_reject_reason=r.qc_reject_reason,
         ))

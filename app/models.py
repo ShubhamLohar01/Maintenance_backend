@@ -256,6 +256,12 @@ class BreakdownRecord(RdsBase):
     qc_status:              Mapped[str | None]      = mapped_column(String(16), nullable=True)               # PENDING|APPROVED|REJECTED
     qc_reject_reason:       Mapped[str | None]      = mapped_column(Text, nullable=True)
     end_time:               Mapped[datetime | None] = mapped_column(DateTime, nullable=True)                 # set when QC approves
+    # Lifecycle transition timestamps surfaced (as epoch ms) on GET /breakdowns/open
+    # so the app can time its reminder escalations. Nullable until each step happens.
+    # (acknowledged_at is the existing `ackn_at`.) Added to RDS via manual ALTER TABLE.
+    resolved_at:            Mapped[datetime | None] = mapped_column(DateTime, nullable=True)                 # technician finished the repair (work-done)
+    qc_acknowledged_at:     Mapped[datetime | None] = mapped_column(DateTime, nullable=True)                 # QC picked up the awaiting-QC ticket
+    qc_decided_at:          Mapped[datetime | None] = mapped_column(DateTime, nullable=True)                 # QC approved or disapproved
     created_at:             Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())
     updated_at:             Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())
 

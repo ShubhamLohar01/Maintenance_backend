@@ -224,3 +224,89 @@ def test_flag_uploads_before_photo_to_s3(auth_client, db_session, monkeypatch):
     fid = r.json()["id"]
     rec = db_session.get(BreakdownRecord, int(fid))
     assert rec.before_photo_url == f"https://bucket.s3.amazonaws.com/breakdowns/{fid}/before.png"
+
+
+# --- P0: lifecycle timestamps on GET /breakdowns/open --------------------------
+# The app escalates reminders on how long a ticket has sat in each state, so every
+# transition time must be present and serialized as epoch-ms ints (parsed as Long
+# client-side), on the same clock as reported_at.
+
+ACK_MS = NOW + 60_000
+DONE_MS = NOW + 120_000
+QCACK_MS = NOW + 180_000
+DECIDE_MS = NOW + 240_000
+
+
+def _open_row(c, fid):
+    return next(x for x in c.get("/breakdowns/open").json() if x["id"] == fid)
+
+
+def test_open_timestamps_null_before_transitions(auth_client, db_session):
+    _seed(db_session)
+    fid = _flag(auth_client)
+    row = _open_row(auth_client, fid)
+    assert row["reported_at"] == NOW
+    assert row["acknowledged_at"] is None
+    assert row["resolved_at"] is None
+    assert row["qc_acknowledged_at"] is None
+    assert row["qc_decided_at"] is None
+
+
+def test_open_serializes_all_four_timestamps_as_epoch_ms(auth_client, db_session):
+    _seed(db_session)
+    fid = _flag(auth_client)
+    # technician acknowledges
+    auth_client.post(f"/breakdowns/{fid}/qc/acknowledge", json={
+        "user_id": "7", "user_name": "Ravi", "acknowledged_at": ACK_MS})
+    # technician finishes the repair
+    auth_client.post(f"/breakdowns/{fid}/work-done", data={
+        "user_id": "7", "user_name": "Ravi", "work_done": "replaced coil",
+        "done_at": DONE_MS})
+    # QC picks up the awaiting-QC ticket (qc_checked_by present)
+    auth_client.post(f"/breakdowns/{fid}/qc/acknowledge", json={
+        "user_id": "9", "user_name": "Qc", "qc_checked_by": "qc.user",
+        "acknowledged_at": QCACK_MS})
+    # QC decides — disapprove keeps it non-closed so it stays visible in /open
+    auth_client.post(f"/breakdowns/{fid}/qc/disapprove", json={
+        "user_id": "9", "user_name": "Qc", "decided_at": DECIDE_MS,
+        "reason": "not fixed"})
+
+    row = _open_row(auth_client, fid)
+    assert row["acknowledged_at"] == ACK_MS
+    assert row["resolved_at"] == DONE_MS
+    assert row["qc_acknowledged_at"] == QCACK_MS
+    assert row["qc_decided_at"] == DECIDE_MS
+    # epoch-ms ints, never ISO strings
+    for k in ("reported_at", "acknowledged_at", "resolved_at",
+              "qc_acknowledged_at", "qc_decided_at"):
+        assert isinstance(row[k], int)
+
+
+def test_qc_pickup_keeps_pending_qc_and_preserves_ackn(auth_client, db_session):
+    _seed(db_session)
+    fid = _flag(auth_client)
+    auth_client.post(f"/breakdowns/{fid}/qc/acknowledge", json={
+        "user_id": "7", "user_name": "Ravi", "acknowledged_at": ACK_MS})
+    auth_client.post(f"/breakdowns/{fid}/work-done", data={
+        "user_id": "7", "user_name": "Ravi", "work_done": "x", "done_at": DONE_MS})
+    # QC pickup must NOT flip the ticket back to ACKNOWLEDGED or clobber ackn_at.
+    resp = auth_client.post(f"/breakdowns/{fid}/qc/acknowledge", json={
+        "user_id": "9", "user_name": "Qc", "qc_checked_by": "qc.user",
+        "acknowledged_at": QCACK_MS}).json()
+    assert resp["ticket_status"] == "PENDING_QC"
+    rec = db_session.get(BreakdownRecord, int(fid))
+    db_session.refresh(rec)
+    assert to_epoch_ms(rec.ackn_at) == ACK_MS            # technician ack preserved
+    assert to_epoch_ms(rec.qc_acknowledged_at) == QCACK_MS
+    assert rec.qc_checked_by == "qc.user"
+
+
+def test_qc_approve_stamps_qc_decided_at(auth_client, db_session):
+    _seed(db_session)
+    fid = _flag(auth_client)
+    auth_client.post(f"/breakdowns/{fid}/qc/approve", json={
+        "user_id": "9", "user_name": "Qc", "decided_at": DECIDE_MS})
+    rec = db_session.get(BreakdownRecord, int(fid))
+    db_session.refresh(rec)
+    assert to_epoch_ms(rec.qc_decided_at) == DECIDE_MS
+    assert to_epoch_ms(rec.end_time) == DECIDE_MS        # existing behavior kept
