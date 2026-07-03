@@ -619,3 +619,25 @@ class DeviceTokenResponse(BaseModel):
     id: int
     user_id: str
     platform: str
+
+
+# --- Add a new asset (POST /mt-machines) ---
+
+class MtMachineCreate(BaseModel):
+    """Create a new mt_asset_list row. The app sends the full row with an empty
+    asset_id; the backend assigns the real (building-prefixed) id — any asset_id or
+    rated_kw sent is ignored (rated_kw is recomputed from power_load). Fields are
+    Optional so a missing required one (building/asset_name/category/sub_location)
+    surfaces as a clear 400 from the handler rather than a 422 from validation.
+    Companion to MtMachineUpdate (PUT); this one additionally persists assigned_to."""
+    building: Optional[str] = None
+    asset_name: Optional[str] = None
+    category: Optional[str] = None
+    sub_location: Optional[str] = None
+    power_load: Optional[str] = None
+    quantity: Optional[int] = None
+    model_no: Optional[str] = None
+    serial_no: Optional[str] = None
+    condition: Optional[str] = None
+    assigned_to: Optional[str] = None
+    remarks: Optional[str] = None

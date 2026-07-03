@@ -1,18 +1,37 @@
 import re
 from typing import List, Optional
 from fastapi import APIRouter, Depends, Query, HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..database import get_rds
 from ..models import MtAsset, MtUser
-from ..schemas import MtMachineDto, MtMachineUpdate
+from ..schemas import MtMachineDto, MtMachineUpdate, MtMachineCreate
 from ..auth import get_current_user
+from ..utils import norm_plant
 
 router = APIRouter(prefix="/mt-machines", tags=["mt-machines"])
 
 # Roles allowed to edit the asset register. The app only shows the edit button to
 # SUPERVISOR for now; HEAD/ADMIN are permitted too.
 _EDIT_ROLES = {"SUPERVISOR", "HEAD", "ADMIN"}
+# Roles allowed to add a new asset (the app now shows "Add machine" to these).
+# OPERATOR is excluded.
+_CREATE_ROLES = {"SUPERVISOR", "HEAD", "TECHNICIAN", "ADMIN"}
+
+
+def _next_asset_id(db: Session, building: str) -> str:
+    """Next building-prefixed asset id, e.g. 'W202-0008' — one past the highest
+    existing NNNN for that building's prefix (norm_plant('W-202') -> 'W202'). Ids
+    that don't match the prefix-NNNN shape are ignored; starts at 0001."""
+    prefix = norm_plant(building) or "AST"
+    pat = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
+    max_n = 0
+    for (aid,) in db.query(MtAsset.asset_id).filter(MtAsset.asset_id.like(f"{prefix}-%")).all():
+        m = pat.match(aid or "")
+        if m:
+            max_n = max(max_n, int(m.group(1)))
+    return f"{prefix}-{max_n + 1:04d}"
 
 
 def _parse_kw(power_load: Optional[str]) -> Optional[float]:
@@ -67,6 +86,66 @@ def list_mt_machines(
         q = q.filter(MtAsset.sub_location == sub_location)
     rows = q.order_by(MtAsset.asset_id.asc()).all()
     return [_to_dto(r) for r in rows]
+
+
+@router.post("", response_model=MtMachineDto, status_code=status.HTTP_201_CREATED)
+def create_mt_machine(
+    payload: MtMachineCreate,
+    db: Session = Depends(get_rds),
+    user: MtUser = Depends(get_current_user),
+):
+    """Add a new asset to mt_asset_list. SUPERVISOR / HEAD / TECHNICIAN / ADMIN only
+    (not OPERATOR). The app sends the full row with an empty asset_id; the backend
+    assigns a building-prefixed id, stores every field, and returns the MtMachineDto
+    (with the assigned asset_id and rated_kw computed from power_load)."""
+    if user.norm_role not in _CREATE_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not allowed to add assets",
+        )
+
+    building = (payload.building or "").strip()
+    asset_name = (payload.asset_name or "").strip()
+    category = (payload.category or "").strip()
+    sub_location = (payload.sub_location or "").strip()
+    missing = [n for n, v in (
+        ("building", building), ("asset_name", asset_name),
+        ("category", category), ("sub_location", sub_location),
+    ) if not v]
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Missing required field(s): {', '.join(missing)}",
+        )
+
+    # asset_id is assigned server-side (any value in the body is ignored). Retry a
+    # couple of times so a rare concurrent insert racing the same id just re-picks.
+    for _ in range(3):
+        row = MtAsset(
+            asset_id=_next_asset_id(db, building),
+            building=building,
+            asset_name=asset_name,
+            category=category,
+            sub_location=sub_location,
+            power_load=payload.power_load,
+            quantity=payload.quantity,
+            model_no=payload.model_no,
+            serial_no=payload.serial_no,
+            condition=payload.condition,
+            assigned_to=payload.assigned_to,
+            remarks=payload.remarks,
+        )
+        db.add(row)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            continue
+        db.refresh(row)
+        return _to_dto(row)
+
+    raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                        detail="Could not allocate an asset id; please retry")
 
 
 @router.put("/{asset_id}", response_model=MtMachineDto)
