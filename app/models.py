@@ -1,6 +1,6 @@
 from datetime import datetime, date
 from decimal import Decimal
-from sqlalchemy import String, Integer, Float, ForeignKey, DateTime, Text, Date, Numeric, UniqueConstraint, CheckConstraint, func
+from sqlalchemy import String, Integer, Float, Boolean, ForeignKey, DateTime, Text, Date, Numeric, UniqueConstraint, CheckConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .database import LocalBase, RdsBase
@@ -98,6 +98,18 @@ class MtAsset(RdsBase):
     assigned_to:         Mapped[str | None]     = mapped_column(String(128), nullable=True)
     warranty_amc_expiry: Mapped[str | None]     = mapped_column(String(64), nullable=True)
     remarks:             Mapped[str | None]     = mapped_column(Text, nullable=True)
+
+    # --- Daily consumption schedule (only "Electric Asset" rows use these) ---
+    # A recurring daily recording window in factory-local (IST) minutes-of-day.
+    # These assets aren't operator-runnable, so a supervisor schedules them and the
+    # backend generates one mt_machine_daily_kwh row per elapsed day (source='SCHEDULE').
+    # SUPERVISOR writes (any plant); HEAD is read-only. See app/api/asset_schedules.py.
+    schedule_start_min:      Mapped[int | None]      = mapped_column(Integer, nullable=True)   # 0..1439, e.g. 600 = 10:00
+    schedule_end_min:        Mapped[int | None]      = mapped_column(Integer, nullable=True)   # must be > start (same-day window)
+    schedule_active:         Mapped[bool]            = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    schedule_last_generated: Mapped[date | None]     = mapped_column(Date, nullable=True)      # backfill high-water mark
+    schedule_updated_by:     Mapped[str | None]      = mapped_column(String(128), nullable=True)
+    schedule_updated_at:     Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class FloorUtilityReading(LocalBase):
@@ -215,7 +227,7 @@ class PreventiveMaintenanceDoc(RdsBase):
 class MachineTransfer(RdsBase):
     """One machine-transfer record (between warehouses) with an optional proof
     photo stored in S3 (`proof_photo_url`)."""
-    __tablename__ = "doc_machine_transfer"
+    __tablename__ = "mt_machine_transfer"
 
     id:                Mapped[int]            = mapped_column(Integer, primary_key=True, autoincrement=True)
     transfer_date:     Mapped[date | None]    = mapped_column(Date, nullable=True)
@@ -223,11 +235,17 @@ class MachineTransfer(RdsBase):
     to_warehouse:      Mapped[str]            = mapped_column(String(32), index=True)
     machine_name:      Mapped[str]            = mapped_column(String(255))
     machine_code:      Mapped[str | None]     = mapped_column(String(128), nullable=True)
+    machine_id:        Mapped[str | None]     = mapped_column(String(64), index=True, nullable=True)  # = mt_asset_list.asset_id when picked from the register
     condition:         Mapped[str | None]     = mapped_column(String(64), nullable=True)
     reason:            Mapped[str | None]     = mapped_column(Text, nullable=True)
     authorised_person: Mapped[str | None]     = mapped_column(String(255), nullable=True)
     remarks:           Mapped[str | None]     = mapped_column(Text, nullable=True)
     proof_photo_url:   Mapped[str | None]     = mapped_column(Text, nullable=True)
+    # Receiving-warehouse acknowledgement: PENDING on create -> APPROVED once the
+    # destination warehouse (technician of that plant, or any supervisor) confirms receipt.
+    status:            Mapped[str]             = mapped_column(String(16), nullable=False, default="PENDING", server_default="PENDING")
+    acknowledged_by:   Mapped[str | None]      = mapped_column(String(128), nullable=True)
+    acknowledged_at:   Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_by:        Mapped[str | None]     = mapped_column(String(128), nullable=True)
     created_at:        Mapped[datetime]       = mapped_column(DateTime, default=datetime.utcnow)
 

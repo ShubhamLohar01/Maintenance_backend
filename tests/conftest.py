@@ -23,6 +23,7 @@ from app.models import (
     MachineDailyKwh,
     MtFloorUtilityReading,
     MtDeviceToken,
+    MachineTransfer,
 )
 
 # RdsBase tables the suite needs (all SQLite-compatible — no JSONB columns).
@@ -34,6 +35,7 @@ _TABLES = [
     MachineDailyKwh,
     MtFloorUtilityReading,
     MtDeviceToken,
+    MachineTransfer,
 ]
 
 

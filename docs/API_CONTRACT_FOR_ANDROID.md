@@ -42,7 +42,7 @@ Everything energy/breakdown/kWh-related keys on **`mt_asset_list.asset_id`**
 **Two databases** (you don't touch these directly, but for context):
 | Engine | Used by | Tables |
 |---|---|---|
-| RDS Postgres (`DATABASE_URL`, `warehouse_db`) | auth + everything maintenance | `mt_users`, `mt_asset_list`, `mt_machine_daily_kwh` (runs + energy), `mt_breakdown_records` (live breakdowns), `mt_doc_breakdown` (F.06 form), `doc_preventive_maintenance`, `doc_machine_transfer` |
+| RDS Postgres (`DATABASE_URL`, `warehouse_db`) | auth + everything maintenance | `mt_users`, `mt_asset_list`, `mt_machine_daily_kwh` (runs + energy), `mt_breakdown_records` (live breakdowns), `mt_doc_breakdown` (F.06 form), `doc_preventive_maintenance`, `mt_machine_transfer` |
 | Local SQLite (`factoryops.db`) | legacy/dev only | `machines`, `floors`, `users`, `user_machine_assignments`, `floor_utility_readings`, `plants` |
 
 **Plant codes:** DB stores `"A-185"` / `"W-202"`; the API accepts either spelling
@@ -167,8 +167,9 @@ Rules: `items` non-empty (400); a `SUBMITTED` checklist may not contain `UNSET` 
 ```
 All entry fields optional (lenient, won't 422); empty `record_date` → NULL. `sr_no`=index+1, `created_by`=JWT, `source='F06_RECORD'` filled server-side. → `201 {ids:[...]}`. Empty `entries` → 400.
 
-### MACHINE TRANSFERS — `doc_machine_transfer` (RDS + S3 photo)
-**`POST /machine-transfers`** — **multipart/form-data** (not JSON): `from_warehouse`*, `to_warehouse`*, `machine_name`* (required, must differ), `date?`, `machine_code?`, `condition?`, `reason?`, `authorised_person?`, `remarks?`, `proof_photo?` (jpeg/png ≤10MB). → `201 {id, proof_photo_url}`. `created_by`=JWT.
+### MACHINE TRANSFERS — `mt_machine_transfer` (RDS + S3 photo)
+**`POST /machine-transfers`** — **multipart/form-data** (not JSON): `from_warehouse`*, `to_warehouse`*, `machine_name`* (required, must differ), `asset_id?`, `date?`, `machine_code?`, `condition?`, `reason?`, `authorised_person?`, `remarks?`, `proof_photo?` (jpeg/png ≤10MB). → `201 {id, proof_photo_url}`. `created_by`=JWT.
+⚠️ **Side effect (2026-07-03):** the transfer also **moves the asset's `building` in `mt_asset_list`** to `to_warehouse`. Send `asset_id` (the picked register row's id) for a precise move. If it's omitted, the backend falls back to a UNIQUE `asset_name` match **within `from_warehouse`** and skips the move when the name is ambiguous (0 or >1 rows) — the transfer still saves either way. So the app should attach `asset_id` whenever the user picked a machine from the register autocomplete, and refresh `GET /mt-machines` after a transfer to show the new building.
 **`GET /machine-transfers`** → `List<MachineTransferListItemDto> {id, date, from_warehouse, to_warehouse, machine_name, condition, created_at(ISO-Z), proof_photo_url}`
 
 ### HEAD VIEWS (token-scoped; HEAD = both plants) — `/head/*`
@@ -232,7 +233,7 @@ ended_at, daily_kwh — filled on STOP. No UNIQUE(machine_id, reading_date) — 
 machine may have several rows per day.
 **`mt_floor_utility_readings`**: building, floor (= asset sub_location), reading_date, meter_reading (actual, technician), daily_kwh (system-generated total) — UNIQUE(building, floor, reading_date), upsert via `POST /floor-readings`.
 **`doc_preventive_maintenance`**: month, checked_by, verified_by, created_by, rows(JSONB full payload).
-**`doc_machine_transfer`**: transfer_date, from_warehouse, to_warehouse, machine_name, machine_code, condition, reason, authorised_person, remarks, proof_photo_url, created_by, created_at.
+**`mt_machine_transfer`**: transfer_date, from_warehouse, to_warehouse, machine_name, machine_code, condition, reason, authorised_person, remarks, proof_photo_url, created_by, created_at.
 **`mt_asset_list`**, **`mt_users`**: read-only via API (managed in pgAdmin / seeded from Excel).
 
 ---

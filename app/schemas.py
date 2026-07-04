@@ -207,6 +207,38 @@ class MtMachineUpdate(BaseModel):
     remarks: Optional[str] = None
 
 
+# --- Schedule Electric Assets (daily consumption recording window) ---
+
+class AssetScheduleDto(BaseModel):
+    """One 'Electric Asset' row from mt_asset_list plus its daily recording schedule.
+    `start_min`/`end_min` are minute-of-day (IST); null = no schedule set. `hours`
+    and `est_daily_kwh` are derived (rated_kw x hours x power_factor) for display."""
+    asset_id: str
+    asset_name: str
+    building: Optional[str] = None
+    sub_location: Optional[str] = None
+    power_load: Optional[str] = None
+    rated_kw: Optional[float] = None
+    condition: Optional[str] = None
+    start_min: Optional[int] = None
+    end_min: Optional[int] = None
+    start_label: Optional[str] = None  # readable 12h form of start_min, e.g. "10:00 AM"
+    end_label: Optional[str] = None    # readable 12h form of end_min, e.g. "7:00 PM"
+    active: bool = False
+    hours: float = 0.0
+    est_daily_kwh: Optional[float] = None
+    updated_by: Optional[str] = None
+    updated_at: Optional[str] = None   # ISO 8601 Z, null when never set
+
+
+class AssetScheduleUpsertRequest(_Trimmed):
+    """Set/replace an electric asset's daily recording window (SUPERVISOR only).
+    Same-day window: 0 <= start_min < end_min <= 1440."""
+    start_min: int
+    end_min: int
+    active: bool = True
+
+
 class FloorSummaryDto(BaseModel):
     floor_id: str
     floor_name: str
@@ -339,7 +371,33 @@ class MachineTransferListItemDto(BaseModel):
     to_warehouse: str
     machine_name: str
     condition: Optional[str] = None
+    machine_code: Optional[str] = None          # returned so the edit form can pre-fill
+    reason: Optional[str] = None
+    authorised_person: Optional[str] = None
+    remarks: Optional[str] = None
     created_at: str  # ISO 8601 UTC
+    proof_photo_url: Optional[str] = None
+    machine_id: Optional[str] = None            # mt_asset_list.asset_id when the row was picked from the register
+    status: str = "PENDING"                     # PENDING | APPROVED (receiving-warehouse ack)
+    acknowledged_by: Optional[str] = None       # name of who acknowledged receipt
+    acknowledged_at: Optional[str] = None       # ISO 8601 Z, null until acknowledged
+    can_acknowledge: bool = False               # true if THIS caller may acknowledge THIS row now
+    can_edit: bool = False                       # true if THIS caller (creator) may edit/delete THIS row (only while PENDING)
+
+
+class MachineTransferEditRequest(_Trimmed):
+    """Edit a still-PENDING transfer (JSON). Same fields as create minus the photo;
+    from/to/machine changes re-point the asset-register move. Only the creator may edit."""
+    from_warehouse: Optional[str] = None
+    to_warehouse: Optional[str] = None
+    machine_name: Optional[str] = None
+    asset_id: Optional[str] = None
+    date: Optional[str] = None                   # ISO yyyy-MM-dd
+    machine_code: Optional[str] = None
+    condition: Optional[str] = None
+    reason: Optional[str] = None
+    authorised_person: Optional[str] = None
+    remarks: Optional[str] = None
 
 
 # --- Breakdown Maintenance Record (CFPLA.C4.F.06) ---
