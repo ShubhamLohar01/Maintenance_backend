@@ -152,4 +152,4 @@ To switch to PostgreSQL later, set
 ## 7. Mobile-app handoff
 
 See [`CONNECT_MOBILE_APP.md`](./CONNECT_MOBILE_APP.md) for the step-by-step
-guide to point the React-Native app at this backend.
+guide to point the React-Native app at this Backend.
