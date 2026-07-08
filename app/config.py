@@ -14,13 +14,18 @@ class Settings(BaseSettings):
 
     jwt_secret: str = "change-me-in-production-please"
     jwt_algorithm: str = "HS256"
-    jwt_expires_hours: int = 8
+    jwt_expires_hours: int = 336  # 14 days — keep in sync with the app's 2-week session (override via JWT_EXPIRES_HOURS)
     dev_bypass_token: str = "dev-bypass-token"
     cost_per_kwh: float = 8.5
     power_factor: float = 0.99  # fixed; used for kWh = rated_kw * hours * power_factor
     # A run open longer than this is treated as an orphan (operator forgot to STOP);
     # /energy/runs/active auto-closes it, capping its duration/kWh at this many hours.
     max_run_hours: float = 16.0
+
+    # Preventive Maintenance: how many days ahead a due plan is turned into a work
+    # order. MUST match the Android app's Constants.PM_GENERATION_LEAD_DAYS (=7) so
+    # the backend generator and the (legacy) on-device scheduler agree on the window.
+    pm_generation_lead_days: int = 7
 
     # AWS S3 — proof-photo / image storage (reuses the existing .env AWS_* keys).
     aws_access_key_id: str = ""

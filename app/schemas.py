@@ -1,5 +1,5 @@
 from datetime import date
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Any
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -699,3 +699,230 @@ class MtMachineCreate(BaseModel):
     condition: Optional[str] = None
     assigned_to: Optional[str] = None
     remarks: Optional[str] = None
+
+
+# ===========================================================================
+# Preventive Maintenance — server-backed plans + work orders (v1).
+# Wire contract: snake_case keys, epoch-ms (int64) for every wall-clock time,
+# enums as plain strings. Read DTOs keep status/enum fields as plain `str` (not
+# Literal) so an unexpected stored value can never 500 a read. See
+# app/api/pm_plans.py + app/api/pm_work_orders.py.
+# ===========================================================================
+
+
+class UserRosterDto(BaseModel):
+    """One user row for GET /users?role= (e.g. the technician-assignment picker)."""
+    id: str
+    name: str
+    role: str        # normalized uppercase (MtUser.norm_role)
+    plant_id: str
+
+
+# --- Plan: checklist item (JSONB element) ---
+# Every field has a default so a partially-shaped stored item never 500s a read.
+class PmPlanItemDto(BaseModel):
+    id: str = ""
+    order_index: int = 0
+    title: str = ""
+    description: str = ""
+    expected_result: str = ""
+    requires_photo: bool = False
+    requires_measurement: bool = False
+    measurement_unit: Optional[str] = None
+    measurement_min: Optional[float] = None
+    measurement_max: Optional[float] = None
+
+
+class PmPlanRequest(_Trimmed):
+    """Create/replace a PM plan (SUPERVISOR). `id` is app-generated ('plan-…') and
+    upserted idempotently. Times are epoch-ms. `created_by` is advisory — the
+    backend stamps the authenticated user."""
+    id: str
+    machine_id: str                         # = mt_asset_list.asset_id
+    machine_name: str
+    description: str = ""
+    trigger_type: str = "TIME"              # TIME | USAGE
+    trigger_interval: int
+    next_due_at: Optional[int] = None       # epoch ms (generator recomputes)
+    last_completed_at: Optional[int] = None
+    assigned_technician_id: str             # = mt_users.id
+    is_active: bool = True
+    created_by: Optional[str] = None
+    created_at: Optional[int] = None        # epoch ms; defaults to server now on first insert
+    updated_at: Optional[int] = None
+    items: List[PmPlanItemDto] = []
+
+
+class PmPlanDto(BaseModel):
+    id: str
+    machine_id: str
+    machine_name: str
+    description: str = ""
+    trigger_type: str = "TIME"
+    trigger_interval: int
+    next_due_at: Optional[int] = None
+    last_completed_at: Optional[int] = None
+    assigned_technician_id: str
+    is_active: bool = True
+    created_by: Optional[str] = None
+    created_at: Optional[int] = None
+    updated_at: Optional[int] = None
+    items: List[PmPlanItemDto] = []
+
+
+# --- Work-order children ---
+class PmSpareDto(BaseModel):
+    id: str = ""
+    spare_name: str = ""
+    quantity_used: float = 0
+    unit: Optional[str] = None
+    notes: Optional[str] = None
+    logged_at: Optional[int] = None
+    logged_by: Optional[str] = None
+
+
+class PmTaskLogDto(BaseModel):
+    id: str = ""
+    template_item_id: Optional[str] = None
+    order_index: int = 0
+    title: str = ""
+    description: str = ""
+    expected_result: str = ""
+    requires_photo: bool = False
+    requires_measurement: bool = False
+    measurement_unit: Optional[str] = None
+    measurement_min: Optional[float] = None
+    measurement_max: Optional[float] = None
+    status: str = "PENDING"                 # PENDING | PASS | FAIL | NOT_APPLICABLE
+    measurement_value: Optional[float] = None
+    photo_url: Optional[str] = None         # S3 URL (uploaded via POST /pm/photos)
+    notes: Optional[str] = None
+    completed_at: Optional[int] = None
+    completed_by: Optional[str] = None
+
+
+class PmWorkOrderDto(BaseModel):
+    id: str
+    plan_id: str
+    machine_id: str
+    machine_name: str
+    template_name: str
+    estimated_duration_minutes: int = 0
+    scheduled_date: Optional[int] = None
+    generated_at: Optional[int] = None
+    status: str = "NOTIFIED"
+    assigned_technician_id: str
+    assigned_technician_name: Optional[str] = None
+    acknowledged_at: Optional[int] = None
+    started_at: Optional[int] = None
+    submitted_at: Optional[int] = None
+    final_notes: Optional[str] = None
+    supervisor_approved_by: Optional[str] = None
+    supervisor_approved_by_name: Optional[str] = None
+    supervisor_approved_at: Optional[int] = None
+    supervisor_rejected_at: Optional[int] = None
+    supervisor_rejection_notes: Optional[str] = None
+    qc_acknowledged_by: Optional[str] = None
+    qc_acknowledged_by_name: Optional[str] = None
+    qc_acknowledged_at: Optional[int] = None
+    qc_checklist: Optional[Any] = None
+    closed_at: Optional[int] = None
+    created_at: Optional[int] = None
+    updated_at: Optional[int] = None
+    task_logs: List[PmTaskLogDto] = []
+    spares: List[PmSpareDto] = []
+
+
+# --- Lifecycle transition request bodies (JSON). `at` is an optional epoch-ms the
+#     app can send for offline-correct timestamps; the backend defaults to now. ---
+class PmAckRequest(_Trimmed):
+    at: Optional[int] = None
+
+
+class PmStartRequest(_Trimmed):
+    at: Optional[int] = None
+
+
+class PmSubmitRequest(_Trimmed):
+    final_notes: str = ""
+    at: Optional[int] = None                # submitted_at
+    task_logs: List[PmTaskLogDto] = []
+    spares: List[PmSpareDto] = []
+
+
+class PmSupervisorApproveRequest(_Trimmed):
+    supervisor_id: str = ""
+    supervisor_name: str = ""
+    at: Optional[int] = None
+
+
+class PmSupervisorRejectRequest(_Trimmed):
+    supervisor_id: str = ""
+    supervisor_name: str = ""
+    notes: str = ""
+    at: Optional[int] = None
+
+
+class PmQcAckRequest(_Trimmed):
+    user_id: str = ""
+    user_name: str = ""
+    at: Optional[int] = None
+
+
+class PmQcDecisionRequest(_Trimmed):
+    """QC approve / disapprove (JSON). `checklist` is the freeform QC sign-off blob
+    stored verbatim in qc_checklist (the app folds in the decider, any notes, and the
+    after-photo URL it uploaded via POST /pm/photos). `notes` is a convenience that's
+    merged into the stored blob when `checklist` is not supplied."""
+    user_id: str = ""
+    user_name: str = ""
+    checklist: Optional[Any] = None
+    notes: str = ""
+    at: Optional[int] = None
+
+
+class PmGenerateResponse(BaseModel):
+    generated: int
+
+
+class PmPhotoUploadResponse(BaseModel):
+    url: str
+
+
+class MtUserDto(BaseModel):
+    """A row from mt_users — the app-managed user directory (HEAD-only CRUD)."""
+    id: int
+    emp_id: Optional[str] = None
+    name: str
+    location: Optional[str] = None
+    contact_no: Optional[str] = None
+    email_id: Optional[str] = None
+    role: Optional[str] = None
+    username: str
+    created_at: Optional[str] = None
+
+
+class MtUserCreate(BaseModel):
+    """Create a new mt_users row (HEAD/ADMIN only). Fields are Optional so a missing
+    required one (name/username) surfaces as a clear 400 from the handler rather than a
+    422 from validation. There is no password field — every user shares the fixed login
+    password."""
+    emp_id: Optional[str] = None
+    name: Optional[str] = None
+    location: Optional[str] = None
+    contact_no: Optional[str] = None
+    email_id: Optional[str] = None
+    role: Optional[str] = None
+    username: Optional[str] = None
+
+
+class MtUserUpdate(BaseModel):
+    """Full overwrite of an mt_users row (PUT /mt-users/{id}). Same shape as create; the
+    app sends every editable field on each save."""
+    emp_id: Optional[str] = None
+    name: Optional[str] = None
+    location: Optional[str] = None
+    contact_no: Optional[str] = None
+    email_id: Optional[str] = None
+    role: Optional[str] = None
+    username: Optional[str] = None
