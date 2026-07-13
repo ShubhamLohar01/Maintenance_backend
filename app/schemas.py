@@ -1,5 +1,5 @@
 from datetime import date
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Any
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -207,6 +207,38 @@ class MtMachineUpdate(BaseModel):
     remarks: Optional[str] = None
 
 
+# --- Schedule Electric Assets (daily consumption recording window) ---
+
+class AssetScheduleDto(BaseModel):
+    """One 'Electric Asset' row from mt_asset_list plus its daily recording schedule.
+    `start_min`/`end_min` are minute-of-day (IST); null = no schedule set. `hours`
+    and `est_daily_kwh` are derived (rated_kw x hours x power_factor) for display."""
+    asset_id: str
+    asset_name: str
+    building: Optional[str] = None
+    sub_location: Optional[str] = None
+    power_load: Optional[str] = None
+    rated_kw: Optional[float] = None
+    condition: Optional[str] = None
+    start_min: Optional[int] = None
+    end_min: Optional[int] = None
+    start_label: Optional[str] = None  # readable 12h form of start_min, e.g. "10:00 AM"
+    end_label: Optional[str] = None    # readable 12h form of end_min, e.g. "7:00 PM"
+    active: bool = False
+    hours: float = 0.0
+    est_daily_kwh: Optional[float] = None
+    updated_by: Optional[str] = None
+    updated_at: Optional[str] = None   # ISO 8601 Z, null when never set
+
+
+class AssetScheduleUpsertRequest(_Trimmed):
+    """Set/replace an electric asset's daily recording window (SUPERVISOR only).
+    Same-day window: 0 <= start_min < end_min <= 1440."""
+    start_min: int
+    end_min: int
+    active: bool = True
+
+
 class FloorSummaryDto(BaseModel):
     floor_id: str
     floor_name: str
@@ -339,7 +371,33 @@ class MachineTransferListItemDto(BaseModel):
     to_warehouse: str
     machine_name: str
     condition: Optional[str] = None
+    machine_code: Optional[str] = None          # returned so the edit form can pre-fill
+    reason: Optional[str] = None
+    authorised_person: Optional[str] = None
+    remarks: Optional[str] = None
     created_at: str  # ISO 8601 UTC
+    proof_photo_url: Optional[str] = None
+    machine_id: Optional[str] = None            # mt_asset_list.asset_id when the row was picked from the register
+    status: str = "PENDING"                     # PENDING | APPROVED (receiving-warehouse ack)
+    acknowledged_by: Optional[str] = None       # name of who acknowledged receipt
+    acknowledged_at: Optional[str] = None       # ISO 8601 Z, null until acknowledged
+    can_acknowledge: bool = False               # true if THIS caller may acknowledge THIS row now
+    can_edit: bool = False                       # true if THIS caller (creator) may edit/delete THIS row (only while PENDING)
+
+
+class MachineTransferEditRequest(_Trimmed):
+    """Edit a still-PENDING transfer (JSON). Same fields as create minus the photo;
+    from/to/machine changes re-point the asset-register move. Only the creator may edit."""
+    from_warehouse: Optional[str] = None
+    to_warehouse: Optional[str] = None
+    machine_name: Optional[str] = None
+    asset_id: Optional[str] = None
+    date: Optional[str] = None                   # ISO yyyy-MM-dd
+    machine_code: Optional[str] = None
+    condition: Optional[str] = None
+    reason: Optional[str] = None
+    authorised_person: Optional[str] = None
+    remarks: Optional[str] = None
 
 
 # --- Breakdown Maintenance Record (CFPLA.C4.F.06) ---
@@ -594,6 +652,278 @@ class OpenBreakdownDto(BaseModel):
     severity: Optional[str] = None
     description: str = ""
     status: str
-    reported_at: Optional[int] = None     # epoch ms
+    reported_at: Optional[int] = None       # epoch ms
+    # Lifecycle transition times (epoch ms, null until they happen) — the app times
+    # its reminder escalations off these; same clock/units as reported_at.
+    acknowledged_at: Optional[int] = None    # technician acknowledged
+    resolved_at: Optional[int] = None        # technician finished the repair (work-done)
+    qc_acknowledged_at: Optional[int] = None # QC picked up the awaiting-QC ticket
+    qc_decided_at: Optional[int] = None      # QC approved or disapproved
     building: Optional[str] = None
     qc_reject_reason: Optional[str] = None  # why QC sent it back (null unless re-opened by a disapprove)
+
+
+# --- Device push-token registration (P2 FCM push scaffolding) ---
+
+class DeviceTokenRequest(_Trimmed):
+    """Register/refresh this device's FCM token. `user_id` is an optional hint —
+    it defaults to the authenticated caller. Upserted on `token`."""
+    user_id: str = ""
+    token: str
+    platform: str = "android"
+
+
+class DeviceTokenResponse(BaseModel):
+    id: int
+    user_id: str
+    platform: str
+
+
+# --- Add a new asset (POST /mt-machines) ---
+
+class MtMachineCreate(BaseModel):
+    """Create a new mt_asset_list row. The app sends the full row with an empty
+    asset_id; the backend assigns the real (building-prefixed) id — any asset_id or
+    rated_kw sent is ignored (rated_kw is recomputed from power_load). Fields are
+    Optional so a missing required one (building/asset_name/category/sub_location)
+    surfaces as a clear 400 from the handler rather than a 422 from validation.
+    Companion to MtMachineUpdate (PUT); this one additionally persists assigned_to."""
+    building: Optional[str] = None
+    asset_name: Optional[str] = None
+    category: Optional[str] = None
+    sub_location: Optional[str] = None
+    power_load: Optional[str] = None
+    quantity: Optional[int] = None
+    model_no: Optional[str] = None
+    serial_no: Optional[str] = None
+    condition: Optional[str] = None
+    assigned_to: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+# ===========================================================================
+# Preventive Maintenance — server-backed plans + work orders (v1).
+# Wire contract: snake_case keys, epoch-ms (int64) for every wall-clock time,
+# enums as plain strings. Read DTOs keep status/enum fields as plain `str` (not
+# Literal) so an unexpected stored value can never 500 a read. See
+# app/api/pm_plans.py + app/api/pm_work_orders.py.
+# ===========================================================================
+
+
+class UserRosterDto(BaseModel):
+    """One user row for GET /users?role= (e.g. the technician-assignment picker)."""
+    id: str
+    name: str
+    role: str        # normalized uppercase (MtUser.norm_role)
+    plant_id: str
+
+
+# --- Plan: checklist item (JSONB element) ---
+# Every field has a default so a partially-shaped stored item never 500s a read.
+class PmPlanItemDto(BaseModel):
+    id: str = ""
+    order_index: int = 0
+    title: str = ""
+    description: str = ""
+    expected_result: str = ""
+    requires_photo: bool = False
+    requires_measurement: bool = False
+    measurement_unit: Optional[str] = None
+    measurement_min: Optional[float] = None
+    measurement_max: Optional[float] = None
+
+
+class PmPlanRequest(_Trimmed):
+    """Create/replace a PM plan (SUPERVISOR). `id` is app-generated ('plan-…') and
+    upserted idempotently. Times are epoch-ms. `created_by` is advisory — the
+    backend stamps the authenticated user."""
+    id: str
+    machine_id: str                         # = mt_asset_list.asset_id
+    machine_name: str
+    description: str = ""
+    trigger_type: str = "TIME"              # TIME | USAGE
+    trigger_interval: int
+    next_due_at: Optional[int] = None       # epoch ms (generator recomputes)
+    last_completed_at: Optional[int] = None
+    assigned_technician_id: str             # = mt_users.id (name is resolved server-side from mt_users)
+    is_active: bool = True
+    created_by: Optional[str] = None
+    created_at: Optional[int] = None        # epoch ms; defaults to server now on first insert
+    updated_at: Optional[int] = None
+    items: List[PmPlanItemDto] = []
+
+
+class PmPlanDto(BaseModel):
+    id: str
+    machine_id: str
+    machine_name: str
+    description: str = ""
+    trigger_type: str = "TIME"
+    trigger_interval: int
+    next_due_at: Optional[int] = None
+    last_completed_at: Optional[int] = None
+    assigned_technician_id: str
+    assigned_technician_name: Optional[str] = None
+    is_active: bool = True
+    created_by: Optional[str] = None
+    created_at: Optional[int] = None
+    updated_at: Optional[int] = None
+    items: List[PmPlanItemDto] = []
+
+
+# --- Work-order children ---
+class PmSpareDto(BaseModel):
+    id: str = ""
+    spare_name: str = ""
+    quantity_used: float = 0
+    unit: Optional[str] = None
+    notes: Optional[str] = None
+    logged_at: Optional[int] = None
+    logged_by: Optional[str] = None
+
+
+class PmTaskLogDto(BaseModel):
+    id: str = ""
+    template_item_id: Optional[str] = None
+    order_index: int = 0
+    title: str = ""
+    description: str = ""
+    expected_result: str = ""
+    requires_photo: bool = False
+    requires_measurement: bool = False
+    measurement_unit: Optional[str] = None
+    measurement_min: Optional[float] = None
+    measurement_max: Optional[float] = None
+    status: str = "PENDING"                 # PENDING | PASS | FAIL | NOT_APPLICABLE
+    measurement_value: Optional[float] = None
+    photo_url: Optional[str] = None         # S3 URL (uploaded via POST /pm/photos)
+    notes: Optional[str] = None
+    completed_at: Optional[int] = None
+    completed_by: Optional[str] = None
+
+
+class PmWorkOrderDto(BaseModel):
+    id: str
+    plan_id: str
+    machine_id: str
+    machine_name: str
+    template_name: str
+    estimated_duration_minutes: int = 0
+    scheduled_date: Optional[int] = None
+    generated_at: Optional[int] = None
+    status: str = "NOTIFIED"
+    assigned_technician_id: str
+    assigned_technician_name: Optional[str] = None
+    acknowledged_at: Optional[int] = None
+    started_at: Optional[int] = None
+    submitted_at: Optional[int] = None
+    final_notes: Optional[str] = None
+    supervisor_approved_by: Optional[str] = None
+    supervisor_approved_by_name: Optional[str] = None
+    supervisor_approved_at: Optional[int] = None
+    supervisor_rejected_at: Optional[int] = None
+    supervisor_rejection_notes: Optional[str] = None
+    qc_acknowledged_by: Optional[str] = None
+    qc_acknowledged_by_name: Optional[str] = None
+    qc_acknowledged_at: Optional[int] = None
+    qc_checklist: Optional[Any] = None
+    closed_at: Optional[int] = None
+    created_at: Optional[int] = None
+    updated_at: Optional[int] = None
+    task_logs: List[PmTaskLogDto] = []
+    spares: List[PmSpareDto] = []
+
+
+# --- Lifecycle transition request bodies (JSON). `at` is an optional epoch-ms the
+#     app can send for offline-correct timestamps; the backend defaults to now. ---
+class PmAckRequest(_Trimmed):
+    at: Optional[int] = None
+
+
+class PmStartRequest(_Trimmed):
+    at: Optional[int] = None
+
+
+class PmSubmitRequest(_Trimmed):
+    final_notes: str = ""
+    at: Optional[int] = None                # submitted_at
+    task_logs: List[PmTaskLogDto] = []
+    spares: List[PmSpareDto] = []
+
+
+class PmSupervisorApproveRequest(_Trimmed):
+    supervisor_id: str = ""
+    supervisor_name: str = ""
+    at: Optional[int] = None
+
+
+class PmSupervisorRejectRequest(_Trimmed):
+    supervisor_id: str = ""
+    supervisor_name: str = ""
+    notes: str = ""
+    at: Optional[int] = None
+
+
+class PmQcAckRequest(_Trimmed):
+    user_id: str = ""
+    user_name: str = ""
+    at: Optional[int] = None
+
+
+class PmQcDecisionRequest(_Trimmed):
+    """QC approve / disapprove (JSON). `checklist` is the freeform QC sign-off blob
+    stored verbatim in qc_checklist (the app folds in the decider, any notes, and the
+    after-photo URL it uploaded via POST /pm/photos). `notes` is a convenience that's
+    merged into the stored blob when `checklist` is not supplied."""
+    user_id: str = ""
+    user_name: str = ""
+    checklist: Optional[Any] = None
+    notes: str = ""
+    at: Optional[int] = None
+
+
+class PmGenerateResponse(BaseModel):
+    generated: int
+
+
+class PmPhotoUploadResponse(BaseModel):
+    url: str
+
+
+class MtUserDto(BaseModel):
+    """A row from mt_users — the app-managed user directory (HEAD-only CRUD)."""
+    id: int
+    emp_id: Optional[str] = None
+    name: str
+    location: Optional[str] = None
+    contact_no: Optional[str] = None
+    email_id: Optional[str] = None
+    role: Optional[str] = None
+    username: str
+    created_at: Optional[str] = None
+
+
+class MtUserCreate(BaseModel):
+    """Create a new mt_users row (HEAD/ADMIN only). Fields are Optional so a missing
+    required one (name/username) surfaces as a clear 400 from the handler rather than a
+    422 from validation. There is no password field — every user shares the fixed login
+    password."""
+    emp_id: Optional[str] = None
+    name: Optional[str] = None
+    location: Optional[str] = None
+    contact_no: Optional[str] = None
+    email_id: Optional[str] = None
+    role: Optional[str] = None
+    username: Optional[str] = None
+
+
+class MtUserUpdate(BaseModel):
+    """Full overwrite of an mt_users row (PUT /mt-users/{id}). Same shape as create; the
+    app sends every editable field on each save."""
+    emp_id: Optional[str] = None
+    name: Optional[str] = None
+    location: Optional[str] = None
+    contact_no: Optional[str] = None
+    email_id: Optional[str] = None
+    role: Optional[str] = None
+    username: Optional[str] = None

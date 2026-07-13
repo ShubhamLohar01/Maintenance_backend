@@ -2,6 +2,9 @@
 .env
 .env.*
 !.env.example
+# Firebase service-account key (FCM push) — secret, load via FCM_CREDENTIALS_FILE
+*firebase-adminsdk*.json
+*-adminsdk-*.json
 
 # Python
 __pycache__/

@@ -76,6 +76,13 @@ def scoped_buildings(user, requested: str | None = None) -> list[str]:
     return [own] if own else []
 
 
+def is_shut_down(condition: str | None) -> bool:
+    """True when an asset's free-text `condition` is the reserved shut-down sentinel.
+    Matched trimmed + case-insensitively, so 'Shut Down' / 'shut down' / ' Shut Down '
+    are all equivalent (the app matches the same way)."""
+    return (condition or "").strip().casefold() == "shut down"
+
+
 _KW_RE = re.compile(r"([\d.]+)\s*(kw|watt|w)\b", re.IGNORECASE)
 
 

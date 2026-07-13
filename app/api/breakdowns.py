@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Form, File, UploadFile
@@ -10,8 +11,11 @@ from ..schemas import (
     QcAckRequest, QcDecideRequest, QcUpdateResponse, OpenBreakdownDto,
 )
 from ..auth import get_current_user
+from ..notifications import fanout
 from ..storage import upload_bytes, image_ext_for
-from ..utils import to_epoch_ms, from_epoch_ms, norm_plant, building_for, ALL_BUILDINGS
+from ..utils import to_epoch_ms, from_epoch_ms, norm_plant, building_for, ALL_BUILDINGS, is_shut_down
+
+log = logging.getLogger("factoryops.breakdowns")
 
 router = APIRouter(tags=["breakdowns"])
 
@@ -91,6 +95,8 @@ async def raise_flag(
     asset = db.query(MtAsset).filter(MtAsset.asset_id == machine_id).first()
     if asset is None:
         raise HTTPException(status_code=404, detail="Asset not found in mt_asset_list")
+    if is_shut_down(asset.condition):
+        raise HTTPException(status_code=409, detail="Machine is shut down")
 
     operator_name = _resolve_name(db, operator_id) or user.name
     rec = BreakdownRecord(
@@ -111,6 +117,26 @@ async def raise_flag(
 
     db.commit()
     db.refresh(rec)
+
+    # Instant push: alert every TECHNICIAN in this asset's plant (a new breakdown is
+    # unassigned, so all plant technicians are notified). Best-effort — a push failure
+    # must never fail the flag itself, and it's a no-op unless FCM_ENABLED is set.
+    try:
+        fanout.send(
+            db,
+            fanout.Notification(
+                type="B1_NEW_BREAKDOWN",
+                entity_id=str(rec.id),
+                target_role="TECHNICIAN",
+                title=f"{rec.severity} breakdown — {asset.asset_name or machine_id}",
+                body=(rec.description or "").strip() or "Needs a technician.",
+                tier=0,
+            ),
+            building=asset.building,
+        )
+    except Exception:  # noqa: BLE001 — never let a push error break the request
+        log.exception("FCM fan-out failed for breakdown %s", rec.id)
+
     return BreakdownFlagResponse(id=str(rec.id), sync_status="SYNCED")
 
 
@@ -121,14 +147,19 @@ def acknowledge(
     db: Session = Depends(get_rds),
     user: MtUser = Depends(get_current_user),
 ):
-    """Technician acknowledges the breakdown -> ACKNOWLEDGED."""
+    """Dual-purpose. Technician acknowledges the breakdown -> ACKNOWLEDGED (ackn_at).
+    QC 'pickup' of an awaiting-QC ticket sends `qc_checked_by`: that path only stamps
+    qc_acknowledged_at + qc_checked_by and DOES NOT change status or ackn_at — the
+    ticket stays PENDING_QC through QC review (the old flip back to ACKNOWLEDGED,
+    which also clobbered the technician's ackn_at, was a bug)."""
     rec = _get_rec(db, rec_id)
-    rec.status = "ACKNOWLEDGED"
-    rec.technician = req.user_name or _resolve_name(db, req.user_id) or user.name
-    rec.ackn_at = _ms_to_naive(req.acknowledged_at)
-    # QC pickup sends its login username; technician/older builds omit it -> leave as-is.
     if req.qc_checked_by:
         rec.qc_checked_by = req.qc_checked_by
+        rec.qc_acknowledged_at = _ms_to_naive(req.acknowledged_at)
+    else:
+        rec.status = "ACKNOWLEDGED"
+        rec.technician = req.user_name or _resolve_name(db, req.user_id) or user.name
+        rec.ackn_at = _ms_to_naive(req.acknowledged_at)
     db.commit()
     return QcUpdateResponse(
         id=str(rec.id), ticket_status=rec.status,
@@ -156,6 +187,7 @@ async def work_done(
     rec = _get_rec(db, rec_id)
     rec.status = "PENDING_QC"
     rec.qc_status = "PENDING"
+    rec.resolved_at = _ms_to_naive(done_at)           # repair finished (was discarded)
     rec.work_done_des = (work_done or "").strip() or None
     if not rec.technician:
         rec.technician = user_name or _resolve_name(db, user_id) or user.name
@@ -185,6 +217,7 @@ def qc_approve(
     rec.qc_status = "APPROVED"
     rec.qc_checked_by = req.user_name or _resolve_name(db, req.user_id) or user.name
     rec.end_time = _ms_to_naive(req.decided_at) if req.decided_at else now
+    rec.qc_decided_at = _ms_to_naive(req.decided_at) if req.decided_at else now
     if req.after_photo_path and not rec.photo_url:
         rec.photo_url = req.after_photo_path
     db.commit()
@@ -209,6 +242,7 @@ def qc_disapprove(
     rec.qc_status = "DISAPPROVED"
     rec.qc_checked_by = req.user_name or _resolve_name(db, req.user_id) or user.name
     rec.qc_reject_reason = req.reason or req.notes or None
+    rec.qc_decided_at = _ms_to_naive(req.decided_at) if req.decided_at else datetime.utcnow()
     db.commit()
     return QcUpdateResponse(
         id=str(rec.id), ticket_status=rec.status,
@@ -262,6 +296,10 @@ def list_open_breakdowns(
             description=r.description or "",
             status=r.status or "OPEN",
             reported_at=to_epoch_ms(r.start_time),
+            acknowledged_at=to_epoch_ms(r.ackn_at),
+            resolved_at=to_epoch_ms(r.resolved_at),
+            qc_acknowledged_at=to_epoch_ms(r.qc_acknowledged_at),
+            qc_decided_at=to_epoch_ms(r.qc_decided_at),
             building=asset.building,
             qc_reject_reason=r.qc_reject_reason,
         ))

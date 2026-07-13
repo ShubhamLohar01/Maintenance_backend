@@ -1,6 +1,6 @@
 from datetime import datetime, date
 from decimal import Decimal
-from sqlalchemy import String, Integer, Float, ForeignKey, DateTime, Text, Date, Numeric, UniqueConstraint, CheckConstraint, func
+from sqlalchemy import String, Integer, Float, Boolean, ForeignKey, DateTime, Text, Date, Numeric, UniqueConstraint, CheckConstraint, Index, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .database import LocalBase, RdsBase
@@ -98,6 +98,18 @@ class MtAsset(RdsBase):
     assigned_to:         Mapped[str | None]     = mapped_column(String(128), nullable=True)
     warranty_amc_expiry: Mapped[str | None]     = mapped_column(String(64), nullable=True)
     remarks:             Mapped[str | None]     = mapped_column(Text, nullable=True)
+
+    # --- Daily consumption schedule (only "Electric Asset" rows use these) ---
+    # A recurring daily recording window in factory-local (IST) minutes-of-day.
+    # These assets aren't operator-runnable, so a supervisor schedules them and the
+    # backend generates one mt_machine_daily_kwh row per elapsed day (source='SCHEDULE').
+    # SUPERVISOR writes (any plant); HEAD is read-only. See app/api/asset_schedules.py.
+    schedule_start_min:      Mapped[int | None]      = mapped_column(Integer, nullable=True)   # 0..1439, e.g. 600 = 10:00
+    schedule_end_min:        Mapped[int | None]      = mapped_column(Integer, nullable=True)   # must be > start (same-day window)
+    schedule_active:         Mapped[bool]            = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    schedule_last_generated: Mapped[date | None]     = mapped_column(Date, nullable=True)      # backfill high-water mark
+    schedule_updated_by:     Mapped[str | None]      = mapped_column(String(128), nullable=True)
+    schedule_updated_at:     Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class FloorUtilityReading(LocalBase):
@@ -215,7 +227,7 @@ class PreventiveMaintenanceDoc(RdsBase):
 class MachineTransfer(RdsBase):
     """One machine-transfer record (between warehouses) with an optional proof
     photo stored in S3 (`proof_photo_url`)."""
-    __tablename__ = "doc_machine_transfer"
+    __tablename__ = "mt_machine_transfer"
 
     id:                Mapped[int]            = mapped_column(Integer, primary_key=True, autoincrement=True)
     transfer_date:     Mapped[date | None]    = mapped_column(Date, nullable=True)
@@ -223,11 +235,17 @@ class MachineTransfer(RdsBase):
     to_warehouse:      Mapped[str]            = mapped_column(String(32), index=True)
     machine_name:      Mapped[str]            = mapped_column(String(255))
     machine_code:      Mapped[str | None]     = mapped_column(String(128), nullable=True)
+    machine_id:        Mapped[str | None]     = mapped_column(String(64), index=True, nullable=True)  # = mt_asset_list.asset_id when picked from the register
     condition:         Mapped[str | None]     = mapped_column(String(64), nullable=True)
     reason:            Mapped[str | None]     = mapped_column(Text, nullable=True)
     authorised_person: Mapped[str | None]     = mapped_column(String(255), nullable=True)
     remarks:           Mapped[str | None]     = mapped_column(Text, nullable=True)
     proof_photo_url:   Mapped[str | None]     = mapped_column(Text, nullable=True)
+    # Receiving-warehouse acknowledgement: PENDING on create -> APPROVED once the
+    # destination warehouse (technician of that plant, or any supervisor) confirms receipt.
+    status:            Mapped[str]             = mapped_column(String(16), nullable=False, default="PENDING", server_default="PENDING")
+    acknowledged_by:   Mapped[str | None]      = mapped_column(String(128), nullable=True)
+    acknowledged_at:   Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_by:        Mapped[str | None]     = mapped_column(String(128), nullable=True)
     created_at:        Mapped[datetime]       = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -256,6 +274,12 @@ class BreakdownRecord(RdsBase):
     qc_status:              Mapped[str | None]      = mapped_column(String(16), nullable=True)               # PENDING|APPROVED|REJECTED
     qc_reject_reason:       Mapped[str | None]      = mapped_column(Text, nullable=True)
     end_time:               Mapped[datetime | None] = mapped_column(DateTime, nullable=True)                 # set when QC approves
+    # Lifecycle transition timestamps surfaced (as epoch ms) on GET /breakdowns/open
+    # so the app can time its reminder escalations. Nullable until each step happens.
+    # (acknowledged_at is the existing `ackn_at`.) Added to RDS via manual ALTER TABLE.
+    resolved_at:            Mapped[datetime | None] = mapped_column(DateTime, nullable=True)                 # technician finished the repair (work-done)
+    qc_acknowledged_at:     Mapped[datetime | None] = mapped_column(DateTime, nullable=True)                 # QC picked up the awaiting-QC ticket
+    qc_decided_at:          Mapped[datetime | None] = mapped_column(DateTime, nullable=True)                 # QC approved or disapproved
     created_at:             Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())
     updated_at:             Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())
 
@@ -284,3 +308,117 @@ class BreakdownDoc(RdsBase):
     verified_by:             Mapped[str | None]   = mapped_column(String(128), nullable=True)
     created_by:              Mapped[str | None]   = mapped_column(String(128), nullable=True)
     created_at:              Mapped[datetime]     = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class MtDeviceToken(RdsBase):
+    """One registered device push token (FCM), used by the P2 push fan-out. Upserted
+    on `token` (unique) so a device that re-registers updates in place; a single user
+    may have several devices. `user_id` = str(mt_users.id). Nothing is sent while
+    settings.fcm_enabled is false — this table just accumulates tokens meanwhile."""
+    __tablename__ = "mt_device_tokens"
+
+    id:         Mapped[int]      = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id:    Mapped[str]      = mapped_column(String(64), index=True)                 # = str(mt_users.id)
+    token:      Mapped[str]      = mapped_column(String(255), unique=True, index=True)
+    platform:   Mapped[str]      = mapped_column(String(16), default="android", server_default="android")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+# ---------------------------------------------------------------------------
+# Preventive Maintenance (PM) — server-backed plans + work orders (v1).
+#
+# A SUPERVISOR builds a PM PLAN (a checklist bound to ONE asset + a recurring
+# schedule + an assigned technician). The generator turns a due plan into a WORK
+# ORDER whose task logs are a snapshot of the plan's checklist; the technician
+# executes it and QC signs off. Ids are generated OFFLINE by the app
+# ('plan-…', 'wo-…') and upserted idempotently on their id, so a re-sync never
+# duplicates.
+#
+# These two tables use readable TIMESTAMP columns (viewable in pgAdmin):
+#   * Every wall-clock field is a naive-UTC DateTime (timestamp without time zone);
+#     the API converts to/from epoch-ms at the boundary, so the app still speaks its
+#     `Long` milliseconds while the DB stays human-readable. NOTE: stored times are
+#     UTC (e.g. IST 16:00 shows as 10:30).
+#   * The checklist steps (`task_logs`) and `spares` live as JSONB ON the work
+#     order — there is NO separate mt_pm_wo_task_log table.
+# See app/api/pm_plans.py + app/api/pm_work_orders.py.
+# ---------------------------------------------------------------------------
+
+
+class MtPmPlan(RdsBase):
+    """A PM plan: checklist (`items` JSONB) + one machine + a TIME/USAGE schedule.
+    `machine_name` is a snapshot of the asset name (assets can be renamed) and also
+    serves as the plan's display name. Soft-deleted via is_active=false (a DELETE
+    stops future work-order generation but keeps history). All *_at fields are
+    naive-UTC DateTime, surfaced as epoch-ms on the wire."""
+    __tablename__ = "mt_pm_plan"
+
+    id:                     Mapped[str]             = mapped_column(String(64), primary_key=True)    # app-generated 'plan-…'
+    machine_id:             Mapped[str]             = mapped_column(String(64), index=True)          # = mt_asset_list.asset_id
+    machine_name:           Mapped[str]             = mapped_column(String(255))                     # snapshot of asset_name / plan name
+    description:            Mapped[str]             = mapped_column(Text, default="", server_default="")
+    items:                  Mapped[list]            = mapped_column(JSONB, nullable=False, default=list, server_default="[]")
+    trigger_type:           Mapped[str]             = mapped_column(String(8), default="TIME", server_default="TIME")
+    trigger_interval:       Mapped[int]             = mapped_column(Integer, nullable=False)         # days (TIME) | running-hours (USAGE)
+    next_due_at:            Mapped[datetime | None] = mapped_column(DateTime, nullable=True)          # UTC; recomputed by the generator
+    last_completed_at:      Mapped[datetime | None] = mapped_column(DateTime, nullable=True)          # UTC; set when a WO is QC-closed
+    assigned_technician_id: Mapped[str]             = mapped_column(String(64), index=True)          # = mt_users.id
+    assigned_technician_name: Mapped[str | None]    = mapped_column(String(128), nullable=True)      # snapshot of mt_users.name
+    is_active:              Mapped[bool]            = mapped_column(Boolean, default=True, server_default="true")
+    created_by:             Mapped[str | None]      = mapped_column(String(128), nullable=True)
+    created_at:             Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())   # UTC
+    updated_at:             Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())   # UTC
+
+    __table_args__ = (
+        CheckConstraint("trigger_type IN ('TIME','USAGE')", name="ck_pm_plan_trigger"),
+        Index("ix_pm_plan_due", "is_active", "next_due_at"),
+    )
+
+
+class MtPmWorkOrder(RdsBase):
+    """One generated execution instance of a plan. Walks the status machine
+    NOTIFIED → ACKNOWLEDGED → IN_PROGRESS → SUBMITTED → (supervisor approve) →
+    PENDING_QC → (QC approve) → CLOSED (or bounced back on a reject/disapprove).
+    The per-step results (`task_logs`), spare parts (`spares`), and QC sign-off blob
+    (`qc_checklist`) are all JSONB on this row. All *_at fields are naive-UTC DateTime,
+    surfaced as epoch-ms on the wire."""
+    __tablename__ = "mt_pm_work_order"
+
+    id:                          Mapped[str]             = mapped_column(String(64), primary_key=True)   # 'wo-<plan>-<ts>'
+    plan_id:                     Mapped[str]             = mapped_column(String(64), index=True)
+    machine_id:                  Mapped[str]             = mapped_column(String(64), index=True)          # = mt_asset_list.asset_id
+    machine_name:                Mapped[str]             = mapped_column(String(255))                     # snapshot
+    template_name:               Mapped[str]             = mapped_column(String(255))                     # plan/checklist name snapshot
+    estimated_duration_minutes:  Mapped[int]             = mapped_column(Integer, default=0, server_default="0")
+    scheduled_date:              Mapped[datetime | None] = mapped_column(DateTime, nullable=True)          # UTC
+    generated_at:                Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())  # UTC
+    status:                      Mapped[str]             = mapped_column(String(24), default="NOTIFIED", server_default="NOTIFIED", index=True)
+    assigned_technician_id:      Mapped[str]             = mapped_column(String(64), index=True)
+    assigned_technician_name:    Mapped[str | None]      = mapped_column(String(128), nullable=True)
+    acknowledged_at:             Mapped[datetime | None] = mapped_column(DateTime, nullable=True)          # UTC
+    started_at:                  Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    submitted_at:                Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    final_notes:                 Mapped[str | None]      = mapped_column(Text, nullable=True)
+    supervisor_approved_by:      Mapped[str | None]      = mapped_column(String(128), nullable=True)
+    supervisor_approved_by_name: Mapped[str | None]      = mapped_column(String(128), nullable=True)
+    supervisor_approved_at:      Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    supervisor_rejected_at:      Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    supervisor_rejection_notes:  Mapped[str | None]      = mapped_column(Text, nullable=True)
+    qc_acknowledged_by:          Mapped[str | None]      = mapped_column(String(128), nullable=True)
+    qc_acknowledged_by_name:     Mapped[str | None]      = mapped_column(String(128), nullable=True)
+    qc_acknowledged_at:          Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    qc_checklist:                Mapped[dict | None]     = mapped_column(JSONB, nullable=True)            # QC sign-off blob (incl. notes / after-photo url)
+    closed_at:                   Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    task_logs:                   Mapped[list]            = mapped_column(JSONB, nullable=False, default=list, server_default="[]")  # per-step results
+    spares:                      Mapped[list]            = mapped_column(JSONB, nullable=False, default=list, server_default="[]")  # spare parts used
+    created_at:                  Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())  # UTC
+    updated_at:                  Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())  # UTC
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('DRAFT','NOTIFIED','ACKNOWLEDGED','IN_PROGRESS','SUBMITTED',"
+            "'SUPERVISOR_APPROVED','PENDING_QC','QC_APPROVED','CLOSED','OVERDUE','CANCELLED')",
+            name="ck_pm_wo_status",
+        ),
+    )

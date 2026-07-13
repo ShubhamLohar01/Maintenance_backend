@@ -160,3 +160,20 @@ def test_get_returns_remarks(auth_client, db_session):
     rows = resp.json()
     assert len(rows) == 1
     assert rows[0]["remarks"] == "calibrated 2026-06"
+
+
+def test_shut_down_condition_round_trips(login_as, db_session):
+    """The app soft-decommissions a machine by writing condition="Shut Down" and
+    restores it with null. The reserved sentinel must survive PUT->GET verbatim."""
+    _seed_asset(db_session, asset_id="W202-0092")
+    c = login_as(role="SUPERVISOR", location="W-202")
+
+    r = c.put(f"{ENDPOINT}/W202-0092", json=_full_body(condition="Shut Down"))
+    assert r.status_code == 200, r.text
+    assert r.json()["condition"] == "Shut Down"
+    assert c.get(ENDPOINT).json()[0]["condition"] == "Shut Down"
+
+    r2 = c.put(f"{ENDPOINT}/W202-0092", json=_full_body(condition=None))
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["condition"] is None
+    assert c.get(ENDPOINT).json()[0]["condition"] is None

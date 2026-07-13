@@ -9,7 +9,8 @@ from .database import LocalBase, RdsBase, local_engine, rds_engine
 from .api import (
     auth, machines, energy, breakdowns, floors, mt_machines,
     preventive_maintenance, machine_transfers, breakdown_records,
-    live, reports, head, floor_readings,
+    live, reports, head, floor_readings, asset_schedules, devices,
+    users, pm_plans, pm_work_orders, mt_users,
 )
 
 
@@ -104,6 +105,12 @@ def create_app() -> FastAPI:
     app.include_router(reports.router)
     app.include_router(head.router)
     app.include_router(floor_readings.router)
+    app.include_router(asset_schedules.router)
+    app.include_router(devices.router)
+    app.include_router(users.router)
+    app.include_router(mt_users.router)
+    app.include_router(pm_plans.router)
+    app.include_router(pm_work_orders.router)
 
     @app.get("/health", tags=["meta"])
     def health():
