@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..database import get_rds
@@ -28,10 +29,9 @@ from ..schemas import (
 )
 from ..auth import get_current_user
 from ..storage import upload_bytes, image_ext_for
-from ..utils import to_epoch_ms
 from ..config import settings
 from .pm_common import (
-    require_role, ms_to_naive, resolve_user_name, wo_to_dto, QC_ROLES,
+    require_role, ms_to_naive, resolve_user_name, wo_to_dto, QC_ROLES, next_wo_code,
 )
 
 router = APIRouter(prefix="/pm", tags=["pm-work-orders"])
@@ -126,51 +126,64 @@ def generate_due_work_orders(db: Session) -> int:
         if open_exists is not None:
             continue  # a WO for this cycle is already in flight
 
-        wo_id = f"wo-{plan.id}-{to_epoch_ms(now)}"
-        task_logs = []
-        for idx, it in enumerate(plan.items or []):
-            if not isinstance(it, dict):
+        # Sequential human-readable id (WOAA001…), mirroring plan codes. next_wo_code
+        # isn't race-proof on its own (two concurrent sweeps can read the same MAX), so
+        # commit per work order and retry with a fresh code on a primary-key collision —
+        # already-committed WOs from this sweep survive a late collision.
+        for _ in range(5):
+            wo_id = next_wo_code(db)
+            task_logs = []
+            for idx, it in enumerate(plan.items or []):
+                if not isinstance(it, dict):
+                    continue
+                item_id = str(it.get("id") or idx)
+                task_logs.append({
+                    "id": f"log-{wo_id}-{item_id}",
+                    "template_item_id": str(it.get("id")) if it.get("id") else None,
+                    "order_index": int(it.get("order_index") or 0),
+                    "title": str(it.get("title") or ""),
+                    "description": str(it.get("description") or ""),
+                    "expected_result": str(it.get("expected_result") or ""),
+                    "requires_photo": bool(it.get("requires_photo")),
+                    "requires_measurement": bool(it.get("requires_measurement")),
+                    "measurement_unit": it.get("measurement_unit"),
+                    "measurement_min": it.get("measurement_min"),
+                    "measurement_max": it.get("measurement_max"),
+                    "status": "PENDING",
+                    "measurement_value": None,
+                    "photo_url": None,
+                    "notes": None,
+                    "completed_at": None,
+                    "completed_by": None,
+                })
+
+            db.add(MtPmWorkOrder(
+                id=wo_id,
+                plan_id=plan.id,
+                machine_id=plan.machine_id,
+                machine_name=plan.machine_name,
+                template_name=plan.machine_name,   # plan/checklist name snapshot
+                estimated_duration_minutes=0,
+                scheduled_date=next_due,
+                generated_at=now,
+                status="NOTIFIED",
+                assigned_technician_id=plan.assigned_technician_id,
+                assigned_technician_name=resolve_user_name(db, plan.assigned_technician_id),
+                task_logs=task_logs,
+                spares=[],
+                created_at=now,
+                updated_at=now,
+            ))
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
                 continue
-            item_id = str(it.get("id") or idx)
-            task_logs.append({
-                "id": f"log-{wo_id}-{item_id}",
-                "template_item_id": str(it.get("id")) if it.get("id") else None,
-                "order_index": int(it.get("order_index") or 0),
-                "title": str(it.get("title") or ""),
-                "description": str(it.get("description") or ""),
-                "expected_result": str(it.get("expected_result") or ""),
-                "requires_photo": bool(it.get("requires_photo")),
-                "requires_measurement": bool(it.get("requires_measurement")),
-                "measurement_unit": it.get("measurement_unit"),
-                "measurement_min": it.get("measurement_min"),
-                "measurement_max": it.get("measurement_max"),
-                "status": "PENDING",
-                "measurement_value": None,
-                "photo_url": None,
-                "notes": None,
-                "completed_at": None,
-                "completed_by": None,
-            })
+            inserted += 1
+            break
 
-        db.add(MtPmWorkOrder(
-            id=wo_id,
-            plan_id=plan.id,
-            machine_id=plan.machine_id,
-            machine_name=plan.machine_name,
-            template_name=plan.machine_name,   # plan/checklist name snapshot
-            estimated_duration_minutes=0,
-            scheduled_date=next_due,
-            generated_at=now,
-            status="NOTIFIED",
-            assigned_technician_id=plan.assigned_technician_id,
-            assigned_technician_name=resolve_user_name(db, plan.assigned_technician_id),
-            task_logs=task_logs,
-            spares=[],
-            created_at=now,
-            updated_at=now,
-        ))
-        inserted += 1
-
+    # Commit any remaining next_due_at freshness updates for plans that didn't
+    # generate a work order this sweep.
     db.commit()
     return inserted
 

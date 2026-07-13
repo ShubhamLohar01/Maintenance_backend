@@ -123,18 +123,22 @@ class FloorUtilityReading(LocalBase):
 
 
 class MachineDailyKwh(RdsBase):
-    """One production run per row — also the per-machine energy record.
+    """One row per (machine, calendar date) — the per-machine daily energy record.
 
-    Replaces the old `mt_machine_runs` table (retired 2026-06-25): when an
-    operator starts a machine a row is inserted (status='RUNNING', started_at,
-    operator); on stop the backend fills ended_at + daily_kwh and flips status to
-    'COMPLETE'. A machine started/stopped N times in a day = N rows (the old
-    UNIQUE(machine_id, reading_date) constraint is therefore GONE).
+    RUN rows (source='RUN') aggregate every start/stop/pause/resume that machine did
+    that day: there is ONE row per (machine_id, reading_date), and `daily_kwh` is the
+    SUM of that day's run segments (see MtMachineRunSegment). started_at is the day's
+    earliest segment start, ended_at its latest segment end, and status is 'RUNNING'
+    while any segment is open, else 'COMPLETE'. (Superseded the 2026-06-25 one-row-per-run
+    layout, which duplicated a machine's daily row on every pause/resume.) SCHEDULE rows
+    (source='SCHEDULE', from asset_schedules) are unchanged: one already-COMPLETE row per
+    day for non-runnable electric assets, keyed by their own client_run_id.
 
-    `daily_kwh` is computed backend-side from the asset's rated power
-    (mt_asset_list.power_load × run hours × power_factor); it is NULL while the
-    run is still RUNNING. building/floor are a denormalized snapshot from the
-    asset register. Distinct from the floor meter readings (FloorUtilityReading /
+    A partial unique index UNIQUE(machine_id, reading_date) WHERE source='RUN' (created in
+    the migration, Postgres-only) enforces the one-RUN-row-per-day invariant. `daily_kwh`
+    is computed backend-side from the asset's rated power (mt_asset_list.power_load × run
+    hours × power_factor). building/floor are a denormalized snapshot from the asset
+    register. Distinct from the floor meter readings (FloorUtilityReading /
     mt_floor_utility_readings), which are *real* per-floor meter readings."""
     __tablename__ = "mt_machine_daily_kwh"
 
@@ -151,6 +155,35 @@ class MachineDailyKwh(RdsBase):
     ended_at:      Mapped[datetime | None] = mapped_column(DateTime, nullable=True)                 # NULL while RUNNING
     status:        Mapped[str]             = mapped_column(String(16), default="RUNNING", server_default="RUNNING")  # RUNNING | COMPLETE
     daily_kwh:     Mapped[Decimal | None]  = mapped_column(Numeric(14, 4), nullable=True)           # NULL while RUNNING
+    source:        Mapped[str]             = mapped_column(String(16), default="RUN", server_default="RUN")
+    created_at:    Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())
+    updated_at:    Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())
+
+
+class MtMachineRunSegment(RdsBase):
+    """One production run segment — a single START→STOP against a daily kWh row.
+
+    A machine started/stopped/paused/resumed several times on the same calendar day
+    produces ONE MachineDailyKwh row (keyed on machine + date) and MANY of these
+    segments — one per START. The daily row's daily_kwh is the SUM of its segments'
+    kwh, its started_at the earliest segment start, its ended_at the latest segment end.
+    `id` is the run_id handed back to the app; POST /energy/runs/{run_id}/stop closes THIS
+    segment and folds its kWh into the daily row. Idempotent on client_run_id — an
+    offline re-sync replaying a start must not double-open, replaying a stop must not
+    double-add. A machine is 'active' while any of its segments is still open (ended_at
+    IS NULL). SCHEDULE daily rows have no segments."""
+    __tablename__ = "mt_machine_run_segment"
+
+    id:            Mapped[int]             = mapped_column(Integer, primary_key=True, autoincrement=True)
+    daily_id:      Mapped[int]             = mapped_column(Integer, ForeignKey("mt_machine_daily_kwh.id"), index=True)
+    machine_id:    Mapped[str]             = mapped_column(String(64), index=True)  # = mt_asset_list.asset_id (denormalized for the active query)
+    client_run_id: Mapped[str]             = mapped_column(String(64), unique=True, index=True)  # idempotency key from the app
+    operator_id:   Mapped[str | None]      = mapped_column(String(64), index=True, nullable=True)  # = str(mt_users.id)
+    operator_name: Mapped[str | None]      = mapped_column(String(128), nullable=True)             # denormalized snapshot
+    started_at:    Mapped[datetime]        = mapped_column(DateTime, index=True)
+    ended_at:      Mapped[datetime | None] = mapped_column(DateTime, nullable=True)                 # NULL while open
+    status:        Mapped[str]             = mapped_column(String(16), default="RUNNING", server_default="RUNNING")  # RUNNING | COMPLETE
+    kwh:           Mapped[Decimal | None]  = mapped_column(Numeric(14, 4), nullable=True)           # this segment's kWh (NULL while open)
     source:        Mapped[str]             = mapped_column(String(16), default="RUN", server_default="RUN")
     created_at:    Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())
     updated_at:    Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())
@@ -354,7 +387,8 @@ class MtPmPlan(RdsBase):
     naive-UTC DateTime, surfaced as epoch-ms on the wire."""
     __tablename__ = "mt_pm_plan"
 
-    id:                     Mapped[str]             = mapped_column(String(64), primary_key=True)    # app-generated 'plan-…'
+    id:                     Mapped[str]             = mapped_column(String(64), primary_key=True)    # server-generated 'PLANAA001' (legacy rows: 'plan-<uuid>')
+    client_ref:             Mapped[str | None]      = mapped_column(String(64), nullable=True, unique=True, index=True)  # app's local uuid; idempotency key for offline re-sync
     machine_id:             Mapped[str]             = mapped_column(String(64), index=True)          # = mt_asset_list.asset_id
     machine_name:           Mapped[str]             = mapped_column(String(255))                     # snapshot of asset_name / plan name
     description:            Mapped[str]             = mapped_column(Text, default="", server_default="")

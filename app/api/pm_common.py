@@ -8,6 +8,7 @@ app speaks epoch-ms (`Long`). So we convert AT THE BOUNDARY — `ms_to_naive` on
 in, `to_epoch_ms` on the way out — and the JSON contract stays epoch-ms. The work
 order's checklist steps (`task_logs`) + `spares` are JSONB on the row (no child table).
 """
+import re
 from datetime import datetime
 from typing import Iterable, Optional
 
@@ -22,6 +23,60 @@ from ..utils import to_epoch_ms, from_epoch_ms
 # hold a bare 'QC'; the spec splits it into QC_MEMBER / QC_HEAD. Accept all three
 # for QC actions, and treat QC_HEAD as the only role that may override-acknowledge.
 QC_ROLES = {"QC", "QC_MEMBER", "QC_HEAD"}
+
+
+# --- human-friendly sequential ids: <PREFIX>AA001 -> …AA999 -> …AB001 -> … ---
+# Fixed-width + zero-padded, so lexicographic order == sequence order (the DB's
+# string MAX is the numeric max). Each two-letter block holds 999 codes (001-999);
+# 26*26 blocks => 675,324 total per prefix. Legacy uuid-style rows ('plan-<uuid>',
+# 'wo-plan-…') don't match the pattern and are ignored, so each sequence starts
+# fresh at <PREFIX>AA001.
+_CODES_PER_BLOCK = 999
+_MAX_CODE_INDEX = 26 * 26 * _CODES_PER_BLOCK  # exclusive upper bound
+
+
+def _code_to_index(prefix: str, code: Optional[str]) -> int:
+    """<PREFIX>AA001 -> 0-based sequence index; -1 for anything that isn't a valid code."""
+    m = re.match(rf"^{prefix}([A-Z])([A-Z])(\d{{3}})$", code or "")
+    if not m:
+        return -1
+    a, b, num = m.group(1), m.group(2), int(m.group(3))
+    if not (1 <= num <= _CODES_PER_BLOCK):
+        return -1
+    block = (ord(a) - 65) * 26 + (ord(b) - 65)
+    return block * _CODES_PER_BLOCK + (num - 1)
+
+
+def _index_to_code(prefix: str, i: int) -> str:
+    """0-based sequence index -> <PREFIX>AA001. 500 if the code space is exhausted."""
+    if i < 0 or i >= _MAX_CODE_INDEX:
+        raise HTTPException(status_code=500, detail=f"{prefix} code space exhausted")
+    block, within = divmod(i, _CODES_PER_BLOCK)
+    a, b = divmod(block, 26)
+    return f"{prefix}{chr(65 + a)}{chr(65 + b)}{within + 1:03d}"
+
+
+def _next_code(db: Session, model, prefix: str) -> str:
+    """The next unused sequential code for `model.id`. Reads the current MAX
+    '<PREFIX>%' id (fixed width => the string max is the highest code) and increments.
+    Not race-proof on its own; callers retry the insert on a primary-key collision."""
+    latest = (
+        db.query(model.id)
+        .filter(model.id.like(f"{prefix}%"))
+        .order_by(model.id.desc())
+        .first()
+    )
+    return _index_to_code(prefix, (_code_to_index(prefix, latest[0]) if latest else -1) + 1)
+
+
+def next_plan_code(db: Session) -> str:
+    """First plan -> PLANAA001."""
+    return _next_code(db, MtPmPlan, "PLAN")
+
+
+def next_wo_code(db: Session) -> str:
+    """First work order -> WOAA001."""
+    return _next_code(db, MtPmWorkOrder, "WO")
 
 
 def ms_to_naive(ms: Optional[int]) -> Optional[datetime]:
@@ -60,6 +115,7 @@ def resolve_user_name(db: Session, uid: Optional[str], fallback: Optional[str] =
 def plan_to_dto(p: MtPmPlan) -> PmPlanDto:
     return PmPlanDto(
         id=p.id,
+        client_ref=p.client_ref,
         machine_id=p.machine_id,
         machine_name=p.machine_name,
         description=p.description or "",

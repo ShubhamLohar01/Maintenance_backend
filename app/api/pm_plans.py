@@ -1,22 +1,24 @@
 """Preventive-Maintenance PLANS — CRUD for the supervisor's plan editor.
 
 A plan = a checklist bound to one asset + a recurring schedule + an assigned
-technician. Ids are app-generated ('plan-…') and upserted idempotently on their
-id (a re-sync never duplicates). Writes are SUPERVISOR-only; reads are open to any
-authenticated caller. DELETE is a soft-delete (is_active=false) so historical work
-orders that reference the plan stay intact.
+technician. Ids are server-generated on create ('PLANAA001', sequential; legacy rows
+keep their old 'plan-<uuid>'), and creation is idempotent on `client_ref` (the app's
+local uuid) so an offline re-sync never duplicates. Writes are SUPERVISOR-only; reads
+are open to any authenticated caller. DELETE is a soft-delete (is_active=false) so
+historical work orders that reference the plan stay intact.
 """
 from datetime import datetime
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..database import get_rds
 from ..models import MtAsset, MtPmPlan, MtUser
 from ..schemas import PmPlanRequest, PmPlanDto
 from ..auth import get_current_user
-from .pm_common import require_role, ms_to_naive, resolve_user_name, plan_to_dto
+from .pm_common import require_role, ms_to_naive, resolve_user_name, plan_to_dto, next_plan_code
 
 router = APIRouter(prefix="/pm/plans", tags=["pm-plans"])
 
@@ -64,21 +66,37 @@ def create_plan(
     db: Session = Depends(get_rds),
     user: MtUser = Depends(get_current_user),
 ):
-    """Create a plan, or idempotently replace one already stored under the same id
-    (offline re-sync). SUPERVISOR only."""
+    """Create a plan. The backend assigns the id (server-generated 'PLANAA001…'); any
+    `id` in the body is ignored. Idempotent on `client_ref` (the app's local uuid): a
+    re-post with a client_ref that already exists updates that plan instead of making a
+    duplicate — so a lost-response retry is safe. SUPERVISOR only."""
     require_role(user, {"SUPERVISOR"})
     _validate(req, db)
-    existing = db.get(MtPmPlan, req.id)
-    if existing is None:
-        plan = MtPmPlan(id=req.id)
+
+    # Offline re-sync: same client_ref -> update the existing plan (no duplicate).
+    if req.client_ref:
+        existing = db.query(MtPmPlan).filter(MtPmPlan.client_ref == req.client_ref).first()
+        if existing is not None:
+            _apply(req, existing, user, creating=False, db=db)
+            db.commit()
+            db.refresh(existing)
+            return plan_to_dto(existing)
+
+    # New plan: assign the next sequential code. next_plan_code isn't race-proof on its
+    # own, so on the rare concurrent-insert primary-key collision we re-read and retry.
+    for _ in range(5):
+        plan = MtPmPlan(id=next_plan_code(db), client_ref=req.client_ref or None)
         _apply(req, plan, user, creating=True, db=db)
         db.add(plan)
-    else:
-        plan = existing
-        _apply(req, plan, user, creating=False, db=db)
-    db.commit()
-    db.refresh(plan)
-    return plan_to_dto(plan)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            continue
+        db.refresh(plan)
+        return plan_to_dto(plan)
+
+    raise HTTPException(status_code=503, detail="could not allocate a plan id, please retry")
 
 
 @router.get("", response_model=List[PmPlanDto])

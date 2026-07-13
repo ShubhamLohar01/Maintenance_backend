@@ -734,10 +734,14 @@ class PmPlanItemDto(BaseModel):
 
 
 class PmPlanRequest(_Trimmed):
-    """Create/replace a PM plan (SUPERVISOR). `id` is app-generated ('plan-…') and
-    upserted idempotently. Times are epoch-ms. `created_by` is advisory — the
-    backend stamps the authenticated user."""
-    id: str
+    """Create/replace a PM plan (SUPERVISOR). On CREATE (POST) the backend assigns the
+    id (server-generated 'PLANAA001…'); any `id` in the body is ignored — use the id
+    from the response for later GET/PUT/DELETE. `client_ref` (the app's local uuid) is
+    the idempotency key: re-posting the same client_ref updates the existing plan instead
+    of creating a duplicate. On PUT the path id identifies the plan. Times are epoch-ms;
+    `created_by` is advisory — the backend stamps the authenticated user."""
+    id: Optional[str] = None                # ignored on create (server-assigned); path wins on PUT
+    client_ref: Optional[str] = None        # app's local uuid; idempotency key for offline re-sync
     machine_id: str                         # = mt_asset_list.asset_id
     machine_name: str
     description: str = ""
@@ -755,6 +759,7 @@ class PmPlanRequest(_Trimmed):
 
 class PmPlanDto(BaseModel):
     id: str
+    client_ref: Optional[str] = None
     machine_id: str
     machine_name: str
     description: str = ""
