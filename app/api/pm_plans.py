@@ -6,6 +6,7 @@ id (a re-sync never duplicates). Writes are SUPERVISOR-only; reads are open to a
 authenticated caller. DELETE is a soft-delete (is_active=false) so historical work
 orders that reference the plan stay intact.
 """
+from datetime import datetime
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -15,7 +16,7 @@ from ..database import get_rds
 from ..models import MtAsset, MtPmPlan, MtUser
 from ..schemas import PmPlanRequest, PmPlanDto
 from ..auth import get_current_user
-from .pm_common import require_role, now_ms, plan_to_dto
+from .pm_common import require_role, ms_to_naive, resolve_user_name, plan_to_dto
 
 router = APIRouter(prefix="/pm/plans", tags=["pm-plans"])
 
@@ -35,22 +36,25 @@ def _validate(req: PmPlanRequest, db: Session) -> None:
         raise HTTPException(status_code=400, detail=f"machine_id {req.machine_id} not found in mt_asset_list")
 
 
-def _apply(req: PmPlanRequest, plan: MtPmPlan, user: MtUser, creating: bool) -> None:
-    now = now_ms()
+def _apply(req: PmPlanRequest, plan: MtPmPlan, user: MtUser, creating: bool, db: Session) -> None:
+    now = datetime.utcnow()
     plan.machine_id = req.machine_id
     plan.machine_name = req.machine_name
     plan.description = req.description or ""
     plan.items = [it.model_dump() for it in req.items]
     plan.trigger_type = (req.trigger_type or "TIME").upper()
     plan.trigger_interval = req.trigger_interval
-    # next_due_at is NOT NULL — fall back to created_at/now if the app omits it.
-    plan.next_due_at = req.next_due_at if req.next_due_at is not None else (req.created_at or now)
-    plan.last_completed_at = req.last_completed_at
+    # epoch-ms from the app -> naive-UTC datetime; fall back to created_at/now if omitted.
+    plan.next_due_at = ms_to_naive(req.next_due_at) or ms_to_naive(req.created_at) or now
+    plan.last_completed_at = ms_to_naive(req.last_completed_at)
     plan.assigned_technician_id = req.assigned_technician_id
+    # Name ALWAYS comes from the real mt_users directory — never app-supplied/seed.
+    # (null if the id isn't a real mt_users row, which flags bad data to fix there.)
+    plan.assigned_technician_name = resolve_user_name(db, req.assigned_technician_id)
     plan.is_active = req.is_active
     plan.updated_at = now
     if creating:
-        plan.created_at = req.created_at or now
+        plan.created_at = ms_to_naive(req.created_at) or now
         plan.created_by = user.username  # authoritative — the logged-in supervisor
 
 
@@ -67,11 +71,11 @@ def create_plan(
     existing = db.get(MtPmPlan, req.id)
     if existing is None:
         plan = MtPmPlan(id=req.id)
-        _apply(req, plan, user, creating=True)
+        _apply(req, plan, user, creating=True, db=db)
         db.add(plan)
     else:
         plan = existing
-        _apply(req, plan, user, creating=False)
+        _apply(req, plan, user, creating=False, db=db)
     db.commit()
     db.refresh(plan)
     return plan_to_dto(plan)
@@ -119,7 +123,7 @@ def update_plan(
     if plan is None:
         raise HTTPException(status_code=404, detail="plan not found")
     _validate(req, db)
-    _apply(req, plan, user, creating=False)
+    _apply(req, plan, user, creating=False, db=db)
     db.commit()
     db.refresh(plan)
     return plan_to_dto(plan)
@@ -138,7 +142,7 @@ def delete_plan(
     if plan is None:
         raise HTTPException(status_code=404, detail="plan not found")
     plan.is_active = False
-    plan.updated_at = now_ms()
+    plan.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(plan)
     return plan_to_dto(plan)

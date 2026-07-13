@@ -1,6 +1,6 @@
 from datetime import datetime, date
 from decimal import Decimal
-from sqlalchemy import String, Integer, BigInteger, Float, Boolean, ForeignKey, DateTime, Text, Date, Numeric, UniqueConstraint, CheckConstraint, Index, func
+from sqlalchemy import String, Integer, Float, Boolean, ForeignKey, DateTime, Text, Date, Numeric, UniqueConstraint, CheckConstraint, Index, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .database import LocalBase, RdsBase
@@ -335,9 +335,11 @@ class MtDeviceToken(RdsBase):
 # ('plan-…', 'wo-…') and upserted idempotently on their id, so a re-sync never
 # duplicates.
 #
-# These two tables are the canonical, finalized RDS schema (created in pgAdmin):
-#   * EVERY wall-clock field is BIGINT epoch-ms — stored and returned verbatim,
-#     no conversion (matches the app's `Long` model exactly).
+# These two tables use readable TIMESTAMP columns (viewable in pgAdmin):
+#   * Every wall-clock field is a naive-UTC DateTime (timestamp without time zone);
+#     the API converts to/from epoch-ms at the boundary, so the app still speaks its
+#     `Long` milliseconds while the DB stays human-readable. NOTE: stored times are
+#     UTC (e.g. IST 16:00 shows as 10:30).
 #   * The checklist steps (`task_logs`) and `spares` live as JSONB ON the work
 #     order — there is NO separate mt_pm_wo_task_log table.
 # See app/api/pm_plans.py + app/api/pm_work_orders.py.
@@ -349,23 +351,24 @@ class MtPmPlan(RdsBase):
     `machine_name` is a snapshot of the asset name (assets can be renamed) and also
     serves as the plan's display name. Soft-deleted via is_active=false (a DELETE
     stops future work-order generation but keeps history). All *_at fields are
-    epoch-ms (BIGINT)."""
+    naive-UTC DateTime, surfaced as epoch-ms on the wire."""
     __tablename__ = "mt_pm_plan"
 
-    id:                     Mapped[str]        = mapped_column(String(64), primary_key=True)    # app-generated 'plan-…'
-    machine_id:             Mapped[str]        = mapped_column(String(64), index=True)          # = mt_asset_list.asset_id
-    machine_name:           Mapped[str]        = mapped_column(String(255))                     # snapshot of asset_name / plan name
-    description:            Mapped[str]        = mapped_column(Text, default="", server_default="")
-    items:                  Mapped[list]       = mapped_column(JSONB, nullable=False, default=list, server_default="[]")
-    trigger_type:           Mapped[str]        = mapped_column(String(8), default="TIME", server_default="TIME")
-    trigger_interval:       Mapped[int]        = mapped_column(Integer, nullable=False)         # days (TIME) | running-hours (USAGE)
-    next_due_at:            Mapped[int]        = mapped_column(BigInteger, nullable=False)       # epoch ms (recomputed by the generator)
-    last_completed_at:      Mapped[int | None] = mapped_column(BigInteger, nullable=True)        # epoch ms; set when a WO is QC-closed
-    assigned_technician_id: Mapped[str]        = mapped_column(String(64), index=True)          # = mt_users.id
-    is_active:              Mapped[bool]       = mapped_column(Boolean, default=True, server_default="true")
-    created_by:             Mapped[str | None] = mapped_column(String(128), nullable=True)
-    created_at:             Mapped[int]        = mapped_column(BigInteger, nullable=False)       # epoch ms
-    updated_at:             Mapped[int]        = mapped_column(BigInteger, nullable=False)       # epoch ms
+    id:                     Mapped[str]             = mapped_column(String(64), primary_key=True)    # app-generated 'plan-…'
+    machine_id:             Mapped[str]             = mapped_column(String(64), index=True)          # = mt_asset_list.asset_id
+    machine_name:           Mapped[str]             = mapped_column(String(255))                     # snapshot of asset_name / plan name
+    description:            Mapped[str]             = mapped_column(Text, default="", server_default="")
+    items:                  Mapped[list]            = mapped_column(JSONB, nullable=False, default=list, server_default="[]")
+    trigger_type:           Mapped[str]             = mapped_column(String(8), default="TIME", server_default="TIME")
+    trigger_interval:       Mapped[int]             = mapped_column(Integer, nullable=False)         # days (TIME) | running-hours (USAGE)
+    next_due_at:            Mapped[datetime | None] = mapped_column(DateTime, nullable=True)          # UTC; recomputed by the generator
+    last_completed_at:      Mapped[datetime | None] = mapped_column(DateTime, nullable=True)          # UTC; set when a WO is QC-closed
+    assigned_technician_id: Mapped[str]             = mapped_column(String(64), index=True)          # = mt_users.id
+    assigned_technician_name: Mapped[str | None]    = mapped_column(String(128), nullable=True)      # snapshot of mt_users.name
+    is_active:              Mapped[bool]            = mapped_column(Boolean, default=True, server_default="true")
+    created_by:             Mapped[str | None]      = mapped_column(String(128), nullable=True)
+    created_at:             Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())   # UTC
+    updated_at:             Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())   # UTC
 
     __table_args__ = (
         CheckConstraint("trigger_type IN ('TIME','USAGE')", name="ck_pm_plan_trigger"),
@@ -378,38 +381,39 @@ class MtPmWorkOrder(RdsBase):
     NOTIFIED → ACKNOWLEDGED → IN_PROGRESS → SUBMITTED → (supervisor approve) →
     PENDING_QC → (QC approve) → CLOSED (or bounced back on a reject/disapprove).
     The per-step results (`task_logs`), spare parts (`spares`), and QC sign-off blob
-    (`qc_checklist`) are all JSONB on this row. All *_at fields are epoch-ms (BIGINT)."""
+    (`qc_checklist`) are all JSONB on this row. All *_at fields are naive-UTC DateTime,
+    surfaced as epoch-ms on the wire."""
     __tablename__ = "mt_pm_work_order"
 
-    id:                          Mapped[str]        = mapped_column(String(64), primary_key=True)   # 'wo-<plan>-<ts>'
-    plan_id:                     Mapped[str]        = mapped_column(String(64), index=True)
-    machine_id:                  Mapped[str]        = mapped_column(String(64), index=True)          # = mt_asset_list.asset_id
-    machine_name:                Mapped[str]        = mapped_column(String(255))                     # snapshot
-    template_name:               Mapped[str]        = mapped_column(String(255))                     # plan/checklist name snapshot
-    estimated_duration_minutes:  Mapped[int]        = mapped_column(Integer, default=0, server_default="0")
-    scheduled_date:              Mapped[int]        = mapped_column(BigInteger, nullable=False)       # epoch ms
-    generated_at:                Mapped[int]        = mapped_column(BigInteger, nullable=False)       # epoch ms
-    status:                      Mapped[str]        = mapped_column(String(24), default="NOTIFIED", server_default="NOTIFIED", index=True)
-    assigned_technician_id:      Mapped[str]        = mapped_column(String(64), index=True)
-    assigned_technician_name:    Mapped[str | None] = mapped_column(String(128), nullable=True)
-    acknowledged_at:             Mapped[int | None] = mapped_column(BigInteger, nullable=True)        # epoch ms
-    started_at:                  Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    submitted_at:                Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    final_notes:                 Mapped[str | None] = mapped_column(Text, nullable=True)
-    supervisor_approved_by:      Mapped[str | None] = mapped_column(String(128), nullable=True)
-    supervisor_approved_by_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    supervisor_approved_at:      Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    supervisor_rejected_at:      Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    supervisor_rejection_notes:  Mapped[str | None] = mapped_column(Text, nullable=True)
-    qc_acknowledged_by:          Mapped[str | None] = mapped_column(String(128), nullable=True)
-    qc_acknowledged_by_name:     Mapped[str | None] = mapped_column(String(128), nullable=True)
-    qc_acknowledged_at:          Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    qc_checklist:                Mapped[dict | None] = mapped_column(JSONB, nullable=True)            # QC sign-off blob (incl. notes / after-photo url)
-    closed_at:                   Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    task_logs:                   Mapped[list]       = mapped_column(JSONB, nullable=False, default=list, server_default="[]")  # per-step results
-    spares:                      Mapped[list]       = mapped_column(JSONB, nullable=False, default=list, server_default="[]")  # spare parts used
-    created_at:                  Mapped[int]        = mapped_column(BigInteger, nullable=False)       # epoch ms
-    updated_at:                  Mapped[int]        = mapped_column(BigInteger, nullable=False)       # epoch ms
+    id:                          Mapped[str]             = mapped_column(String(64), primary_key=True)   # 'wo-<plan>-<ts>'
+    plan_id:                     Mapped[str]             = mapped_column(String(64), index=True)
+    machine_id:                  Mapped[str]             = mapped_column(String(64), index=True)          # = mt_asset_list.asset_id
+    machine_name:                Mapped[str]             = mapped_column(String(255))                     # snapshot
+    template_name:               Mapped[str]             = mapped_column(String(255))                     # plan/checklist name snapshot
+    estimated_duration_minutes:  Mapped[int]             = mapped_column(Integer, default=0, server_default="0")
+    scheduled_date:              Mapped[datetime | None] = mapped_column(DateTime, nullable=True)          # UTC
+    generated_at:                Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())  # UTC
+    status:                      Mapped[str]             = mapped_column(String(24), default="NOTIFIED", server_default="NOTIFIED", index=True)
+    assigned_technician_id:      Mapped[str]             = mapped_column(String(64), index=True)
+    assigned_technician_name:    Mapped[str | None]      = mapped_column(String(128), nullable=True)
+    acknowledged_at:             Mapped[datetime | None] = mapped_column(DateTime, nullable=True)          # UTC
+    started_at:                  Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    submitted_at:                Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    final_notes:                 Mapped[str | None]      = mapped_column(Text, nullable=True)
+    supervisor_approved_by:      Mapped[str | None]      = mapped_column(String(128), nullable=True)
+    supervisor_approved_by_name: Mapped[str | None]      = mapped_column(String(128), nullable=True)
+    supervisor_approved_at:      Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    supervisor_rejected_at:      Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    supervisor_rejection_notes:  Mapped[str | None]      = mapped_column(Text, nullable=True)
+    qc_acknowledged_by:          Mapped[str | None]      = mapped_column(String(128), nullable=True)
+    qc_acknowledged_by_name:     Mapped[str | None]      = mapped_column(String(128), nullable=True)
+    qc_acknowledged_at:          Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    qc_checklist:                Mapped[dict | None]     = mapped_column(JSONB, nullable=True)            # QC sign-off blob (incl. notes / after-photo url)
+    closed_at:                   Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    task_logs:                   Mapped[list]            = mapped_column(JSONB, nullable=False, default=list, server_default="[]")  # per-step results
+    spares:                      Mapped[list]            = mapped_column(JSONB, nullable=False, default=list, server_default="[]")  # spare parts used
+    created_at:                  Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())  # UTC
+    updated_at:                  Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())  # UTC
 
     __table_args__ = (
         CheckConstraint(

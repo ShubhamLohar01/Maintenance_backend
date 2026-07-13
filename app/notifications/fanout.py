@@ -107,7 +107,11 @@ def tokens_for(db: Session, users: List[MtUser]) -> List[str]:
 def send(db: Session, notif: Notification, building: Optional[str] = None) -> int:
     """Resolve recipients and push `notif` as an FCM data message. Returns the
     number of device tokens targeted. No-op returning 0 while settings.fcm_enabled
-    is false (the app still polls; live push would double-notify)."""
+    is false (the app still polls; live push would double-notify).
+
+    Dead tokens (FCM UNREGISTERED / INVALID_ARGUMENT — the install was removed or
+    the token is malformed) are pruned from mt_device_tokens so the table doesn't
+    rot with stale rows."""
     if not settings.fcm_enabled:
         log.debug("FCM disabled — not sending %s for %s", notif.type, notif.entity_id)
         return 0
@@ -115,27 +119,47 @@ def send(db: Session, notif: Notification, building: Optional[str] = None) -> in
     tokens = tokens_for(db, users)
     if not tokens:
         return 0
-    _push(tokens, notif.envelope())
+    dead = _push(tokens, notif.envelope())
+    if dead:
+        db.query(MtDeviceToken).filter(MtDeviceToken.token.in_(dead)).delete(
+            synchronize_session=False
+        )
+        db.commit()
+        log.info("pruned %d dead FCM token(s)", len(dead))
     return len(tokens)
 
 
-def _push(tokens: List[str], data: dict) -> None:
-    """Send one FCM data message to many tokens. firebase-admin is imported lazily
-    so the dependency is only required once FCM is actually enabled; if it's absent
-    we log and skip rather than crash."""
+def _push(tokens: List[str], data: dict) -> List[str]:
+    """Send one FCM *data* message (no notification block) to many tokens at high
+    Android priority. Returns the tokens FCM reported as dead (UNREGISTERED /
+    INVALID_ARGUMENT) so the caller can delete them.
+
+    firebase-admin is imported lazily so the dependency is only required once FCM
+    is actually enabled; if it's absent we log and skip rather than crash."""
     try:
         import firebase_admin
-        from firebase_admin import credentials, messaging
+        from firebase_admin import credentials, exceptions, messaging
     except ImportError:
         log.error("fcm_enabled but firebase-admin is not installed — skipping push")
-        return
+        return []
     if not firebase_admin._apps:
         firebase_admin.initialize_app(
             credentials.Certificate(settings.fcm_credentials_file)
         )
-    messaging.send_each_for_multicast(
+    resp = messaging.send_each_for_multicast(
         messaging.MulticastMessage(
             tokens=tokens,
             data={k: str(v) for k, v in data.items()},
+            android=messaging.AndroidConfig(priority="high"),
         )
     )
+    dead: List[str] = []
+    for token, r in zip(tokens, resp.responses):
+        if r.success:
+            continue
+        exc = r.exception
+        if isinstance(exc, (messaging.UnregisteredError, exceptions.InvalidArgumentError)):
+            dead.append(token)
+        else:  # transient (e.g. quota / unavailable) — keep the token, just log
+            log.warning("FCM send failed for a token: %s", exc)
+    return dead

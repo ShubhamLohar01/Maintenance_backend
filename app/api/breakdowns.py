@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Form, File, UploadFile
@@ -10,8 +11,11 @@ from ..schemas import (
     QcAckRequest, QcDecideRequest, QcUpdateResponse, OpenBreakdownDto,
 )
 from ..auth import get_current_user
+from ..notifications import fanout
 from ..storage import upload_bytes, image_ext_for
 from ..utils import to_epoch_ms, from_epoch_ms, norm_plant, building_for, ALL_BUILDINGS, is_shut_down
+
+log = logging.getLogger("factoryops.breakdowns")
 
 router = APIRouter(tags=["breakdowns"])
 
@@ -113,6 +117,26 @@ async def raise_flag(
 
     db.commit()
     db.refresh(rec)
+
+    # Instant push: alert every TECHNICIAN in this asset's plant (a new breakdown is
+    # unassigned, so all plant technicians are notified). Best-effort — a push failure
+    # must never fail the flag itself, and it's a no-op unless FCM_ENABLED is set.
+    try:
+        fanout.send(
+            db,
+            fanout.Notification(
+                type="B1_NEW_BREAKDOWN",
+                entity_id=str(rec.id),
+                target_role="TECHNICIAN",
+                title=f"{rec.severity} breakdown — {asset.asset_name or machine_id}",
+                body=(rec.description or "").strip() or "Needs a technician.",
+                tier=0,
+            ),
+            building=asset.building,
+        )
+    except Exception:  # noqa: BLE001 — never let a push error break the request
+        log.exception("FCM fan-out failed for breakdown %s", rec.id)
+
     return BreakdownFlagResponse(id=str(rec.id), sync_status="SYNCED")
 
 

@@ -1,14 +1,14 @@
 """Shared helpers for the Preventive-Maintenance endpoints (plans + work orders).
 
 Kept in one place so pm_plans.py and pm_work_orders.py agree on role enforcement,
-epoch-ms time handling, user-name resolution, and ORM -> DTO mapping.
+time handling, user-name resolution, and ORM -> DTO mapping.
 
-The finalized RDS schema stores EVERY wall-clock field as BIGINT epoch-ms, and the
-work order's checklist steps (`task_logs`) + `spares` as JSONB on the row — so there
-is no boundary conversion and no child table to join. Times are read and written
-verbatim as ints (matching the app's `Long`).
+Storage vs wire: the DB columns are readable naive-UTC DateTime (timestamp), but the
+app speaks epoch-ms (`Long`). So we convert AT THE BOUNDARY — `ms_to_naive` on the way
+in, `to_epoch_ms` on the way out — and the JSON contract stays epoch-ms. The work
+order's checklist steps (`task_logs`) + `spares` are JSONB on the row (no child table).
 """
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Iterable, Optional
 
 from fastapi import HTTPException, status
@@ -16,8 +16,7 @@ from sqlalchemy.orm import Session
 
 from ..models import MtUser, MtPmPlan, MtPmWorkOrder
 from ..schemas import PmPlanDto, PmPlanItemDto, PmTaskLogDto, PmSpareDto, PmWorkOrderDto
-
-DAY_MS = 86_400_000  # ms in a day — matches the app's Constants.DAY_MS
+from ..utils import to_epoch_ms, from_epoch_ms
 
 # QC covers whatever the free-text mt_users.role normalizes to. Existing data may
 # hold a bare 'QC'; the spec splits it into QC_MEMBER / QC_HEAD. Accept all three
@@ -25,9 +24,12 @@ DAY_MS = 86_400_000  # ms in a day — matches the app's Constants.DAY_MS
 QC_ROLES = {"QC", "QC_MEMBER", "QC_HEAD"}
 
 
-def now_ms() -> int:
-    """Current time as epoch-ms (UTC) — the unit every PM *_at column stores."""
-    return int(datetime.now(timezone.utc).timestamp() * 1000)
+def ms_to_naive(ms: Optional[int]) -> Optional[datetime]:
+    """epoch-ms (from the app) -> naive UTC datetime for the DB columns. Naive so it
+    never mixes tz-aware/naive when compared against datetime.utcnow()."""
+    if ms is None:
+        return None
+    return from_epoch_ms(ms).replace(tzinfo=None)
 
 
 def require_role(user: MtUser, allowed: Iterable[str]) -> None:
@@ -63,13 +65,14 @@ def plan_to_dto(p: MtPmPlan) -> PmPlanDto:
         description=p.description or "",
         trigger_type=p.trigger_type or "TIME",
         trigger_interval=p.trigger_interval,
-        next_due_at=p.next_due_at,
-        last_completed_at=p.last_completed_at,
+        next_due_at=to_epoch_ms(p.next_due_at),
+        last_completed_at=to_epoch_ms(p.last_completed_at),
         assigned_technician_id=p.assigned_technician_id,
+        assigned_technician_name=p.assigned_technician_name,
         is_active=bool(p.is_active),
         created_by=p.created_by,
-        created_at=p.created_at,
-        updated_at=p.updated_at,
+        created_at=to_epoch_ms(p.created_at),
+        updated_at=to_epoch_ms(p.updated_at),
         items=[PmPlanItemDto.model_validate(it) for it in (p.items or []) if isinstance(it, dict)],
     )
 
@@ -82,27 +85,27 @@ def wo_to_dto(wo: MtPmWorkOrder) -> PmWorkOrderDto:
         machine_name=wo.machine_name,
         template_name=wo.template_name,
         estimated_duration_minutes=wo.estimated_duration_minutes or 0,
-        scheduled_date=wo.scheduled_date,
-        generated_at=wo.generated_at,
+        scheduled_date=to_epoch_ms(wo.scheduled_date),
+        generated_at=to_epoch_ms(wo.generated_at),
         status=wo.status or "NOTIFIED",
         assigned_technician_id=wo.assigned_technician_id,
         assigned_technician_name=wo.assigned_technician_name,
-        acknowledged_at=wo.acknowledged_at,
-        started_at=wo.started_at,
-        submitted_at=wo.submitted_at,
+        acknowledged_at=to_epoch_ms(wo.acknowledged_at),
+        started_at=to_epoch_ms(wo.started_at),
+        submitted_at=to_epoch_ms(wo.submitted_at),
         final_notes=wo.final_notes,
         supervisor_approved_by=wo.supervisor_approved_by,
         supervisor_approved_by_name=wo.supervisor_approved_by_name,
-        supervisor_approved_at=wo.supervisor_approved_at,
-        supervisor_rejected_at=wo.supervisor_rejected_at,
+        supervisor_approved_at=to_epoch_ms(wo.supervisor_approved_at),
+        supervisor_rejected_at=to_epoch_ms(wo.supervisor_rejected_at),
         supervisor_rejection_notes=wo.supervisor_rejection_notes,
         qc_acknowledged_by=wo.qc_acknowledged_by,
         qc_acknowledged_by_name=wo.qc_acknowledged_by_name,
-        qc_acknowledged_at=wo.qc_acknowledged_at,
+        qc_acknowledged_at=to_epoch_ms(wo.qc_acknowledged_at),
         qc_checklist=wo.qc_checklist,
-        closed_at=wo.closed_at,
-        created_at=wo.created_at,
-        updated_at=wo.updated_at,
+        closed_at=to_epoch_ms(wo.closed_at),
+        created_at=to_epoch_ms(wo.created_at),
+        updated_at=to_epoch_ms(wo.updated_at),
         task_logs=[PmTaskLogDto.model_validate(t) for t in (wo.task_logs or []) if isinstance(t, dict)],
         spares=[PmSpareDto.model_validate(s) for s in (wo.spares or []) if isinstance(s, dict)],
     )

@@ -11,4 +11,4 @@ httpx==0.28.1
 pytest==8.3.4
 psycopg2-binary==2.9.10
 boto3==1.35.71
-# firebase-admin==6.5.0  # P2 push: install + set FCM_ENABLED=true + FCM_CREDENTIALS_FILE to enable live FCM (see app/notifications/fanout.py)
+firebase-admin==6.5.0  # FCM push: needs FCM_ENABLED=true + FCM_CREDENTIALS_FILE to actually send (see app/notifications/fanout.py)

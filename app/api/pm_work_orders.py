@@ -7,12 +7,13 @@ work-order list read first runs a sweep that turns any plan due within
 checklist into the WO's `task_logs` JSONB. `POST /pm/work-orders/generate` forces
 the same sweep (for a cron/manual trigger); no standalone worker process is needed.
 
-Everything is epoch-ms (ints stored verbatim). `task_logs` and `spares` are JSONB
-on the work order (no child table). Photos use the same S3 helper as breakdowns:
-uploaded via `POST /pm/photos` and referenced by URL inside the submit task_logs /
-the QC checklist blob.
+Times are stored as readable naive-UTC DateTime and surfaced as epoch-ms on the wire.
+`task_logs` and `spares` are JSONB on the work order (no child table). Photos use the
+same S3 helper as breakdowns: uploaded via `POST /pm/photos` and referenced by URL
+inside the submit task_logs / the QC checklist blob.
 """
 import uuid
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile
@@ -27,9 +28,10 @@ from ..schemas import (
 )
 from ..auth import get_current_user
 from ..storage import upload_bytes, image_ext_for
+from ..utils import to_epoch_ms
 from ..config import settings
 from .pm_common import (
-    require_role, now_ms, resolve_user_name, wo_to_dto, QC_ROLES, DAY_MS,
+    require_role, ms_to_naive, resolve_user_name, wo_to_dto, QC_ROLES,
 )
 
 router = APIRouter(prefix="/pm", tags=["pm-work-orders"])
@@ -88,8 +90,8 @@ def generate_due_work_orders(db: Session) -> int:
     (unless it already has an open one), snapshotting the checklist into task_logs.
     Mirrors the app's PmSchedulerWorker. Idempotent; safe on every read. Returns the
     number of WOs inserted."""
-    now = now_ms()
-    lead_ms = settings.pm_generation_lead_days * DAY_MS
+    now = datetime.utcnow()
+    lead = timedelta(days=settings.pm_generation_lead_days)
     plans = db.query(MtPmPlan).filter(MtPmPlan.is_active.is_(True)).all()
 
     inserted = 0
@@ -97,14 +99,20 @@ def generate_due_work_orders(db: Session) -> int:
         base = plan.last_completed_at or plan.created_at or now
         if (plan.trigger_type or "TIME").upper() == "USAGE":
             # USAGE (running-hours) integration deferred — mirror the app's 30-day fallback.
-            next_due = base + 30 * DAY_MS
+            next_due = base + timedelta(days=30)
+        elif plan.last_completed_at is not None:
+            # A cycle has completed — schedule from that completion.
+            next_due = plan.last_completed_at + timedelta(days=plan.trigger_interval or 0)
         else:
-            next_due = base + (plan.trigger_interval or 0) * DAY_MS
+            # FIRST cycle: honour the supervisor-chosen first due date the app stored in
+            # next_due_at at plan creation (may be sooner than created_at + interval).
+            # Fall back to created_at + interval when absent.
+            next_due = plan.next_due_at or (base + timedelta(days=plan.trigger_interval or 0))
 
         if plan.next_due_at != next_due:
             plan.next_due_at = next_due  # keep the plan list's due date fresh
 
-        if (next_due - now) > lead_ms:
+        if (next_due - now) > lead:
             continue  # too far out
 
         open_exists = (
@@ -118,7 +126,7 @@ def generate_due_work_orders(db: Session) -> int:
         if open_exists is not None:
             continue  # a WO for this cycle is already in flight
 
-        wo_id = f"wo-{plan.id}-{now}"
+        wo_id = f"wo-{plan.id}-{to_epoch_ms(now)}"
         task_logs = []
         for idx, it in enumerate(plan.items or []):
             if not isinstance(it, dict):
@@ -227,9 +235,9 @@ def acknowledge(
     """Technician acknowledges the notified WO -> ACKNOWLEDGED."""
     require_role(user, {"TECHNICIAN"})
     wo = _get_wo(db, wo_id)
-    now = now_ms()
+    now = datetime.utcnow()
     wo.status = "ACKNOWLEDGED"
-    wo.acknowledged_at = req.at or now
+    wo.acknowledged_at = ms_to_naive(req.at) or now
     wo.updated_at = now
     db.commit()
     return wo_to_dto(wo)
@@ -245,9 +253,9 @@ def start(
     """Technician starts the job -> IN_PROGRESS."""
     require_role(user, {"TECHNICIAN"})
     wo = _get_wo(db, wo_id)
-    now = now_ms()
+    now = datetime.utcnow()
     wo.status = "IN_PROGRESS"
-    wo.started_at = req.at or now
+    wo.started_at = ms_to_naive(req.at) or now
     wo.updated_at = now
     db.commit()
     return wo_to_dto(wo)
@@ -265,12 +273,12 @@ def submit(
     Photos are already-uploaded S3 URLs (see POST /pm/photos)."""
     require_role(user, {"TECHNICIAN"})
     wo = _get_wo(db, wo_id)
-    now = now_ms()
+    now = datetime.utcnow()
     wo.task_logs = [tl.model_dump() for tl in req.task_logs]
     wo.spares = [s.model_dump() for s in req.spares]
     wo.final_notes = req.final_notes or None
     wo.status = "SUBMITTED"
-    wo.submitted_at = req.at or now
+    wo.submitted_at = ms_to_naive(req.at) or now
     wo.updated_at = now
     db.commit()
     return wo_to_dto(wo)
@@ -288,10 +296,10 @@ def supervisor_approve(
     """Supervisor approves the submitted WO -> PENDING_QC (moves to the QC inbox)."""
     require_role(user, {"SUPERVISOR"})
     wo = _get_wo(db, wo_id)
-    now = now_ms()
+    now = datetime.utcnow()
     wo.supervisor_approved_by = req.supervisor_id or str(user.id)
     wo.supervisor_approved_by_name = req.supervisor_name or resolve_user_name(db, req.supervisor_id, user.name)
-    wo.supervisor_approved_at = req.at or now
+    wo.supervisor_approved_at = ms_to_naive(req.at) or now
     wo.status = "PENDING_QC"
     wo.updated_at = now
     db.commit()
@@ -308,7 +316,7 @@ def supervisor_reject(
     """Supervisor sends the WO back to the technician -> IN_PROGRESS, with notes."""
     require_role(user, {"SUPERVISOR"})
     wo = _get_wo(db, wo_id)
-    now = now_ms()
+    now = datetime.utcnow()
     wo.supervisor_approved_by = req.supervisor_id or str(user.id)
     wo.supervisor_approved_by_name = req.supervisor_name or resolve_user_name(db, req.supervisor_id, user.name)
     wo.supervisor_rejected_at = now
@@ -332,10 +340,10 @@ def qc_acknowledge(
     PENDING_QC through review, mirroring the breakdown QC pickup)."""
     require_role(user, QC_ROLES)
     wo = _get_wo(db, wo_id)
-    now = now_ms()
+    now = datetime.utcnow()
     wo.qc_acknowledged_by = req.user_id or str(user.id)
     wo.qc_acknowledged_by_name = req.user_name or resolve_user_name(db, req.user_id, user.name)
-    wo.qc_acknowledged_at = req.at or now
+    wo.qc_acknowledged_at = ms_to_naive(req.at) or now
     wo.updated_at = now
     db.commit()
     return wo_to_dto(wo)
@@ -351,10 +359,10 @@ def qc_override_acknowledge(
     """QC_HEAD takes over an awaiting-QC WO even if a member already acknowledged it."""
     require_role(user, {"QC_HEAD"})
     wo = _get_wo(db, wo_id)
-    now = now_ms()
+    now = datetime.utcnow()
     wo.qc_acknowledged_by = req.user_id or str(user.id)
     wo.qc_acknowledged_by_name = req.user_name or resolve_user_name(db, req.user_id, user.name)
-    wo.qc_acknowledged_at = req.at or now
+    wo.qc_acknowledged_at = ms_to_naive(req.at) or now
     wo.updated_at = now
     db.commit()
     return wo_to_dto(wo)
@@ -373,14 +381,14 @@ def qc_approve(
     referenced inside the checklist blob."""
     require_role(user, QC_ROLES)
     wo = _get_wo(db, wo_id)
-    now = now_ms()
+    now = datetime.utcnow()
     # Capture who did QC even if they skipped the explicit acknowledge step.
     if not wo.qc_acknowledged_by:
         wo.qc_acknowledged_by = req.user_id or str(user.id)
         wo.qc_acknowledged_by_name = req.user_name or resolve_user_name(db, req.user_id, user.name)
-        wo.qc_acknowledged_at = req.at or now
+        wo.qc_acknowledged_at = ms_to_naive(req.at) or now
     wo.qc_checklist = _qc_blob(req, "APPROVED")
-    wo.closed_at = req.at or now
+    wo.closed_at = ms_to_naive(req.at) or now
     wo.status = "CLOSED"
     wo.updated_at = now
 
@@ -388,7 +396,7 @@ def qc_approve(
     if plan is not None:
         plan.last_completed_at = now
         if (plan.trigger_type or "TIME").upper() != "USAGE":
-            plan.next_due_at = now + (plan.trigger_interval or 0) * DAY_MS
+            plan.next_due_at = now + timedelta(days=plan.trigger_interval or 0)
         plan.updated_at = now
 
     db.commit()
@@ -406,11 +414,11 @@ def qc_disapprove(
     reason is kept in the qc_checklist blob."""
     require_role(user, QC_ROLES)
     wo = _get_wo(db, wo_id)
-    now = now_ms()
+    now = datetime.utcnow()
     if not wo.qc_acknowledged_by:
         wo.qc_acknowledged_by = req.user_id or str(user.id)
         wo.qc_acknowledged_by_name = req.user_name or resolve_user_name(db, req.user_id, user.name)
-        wo.qc_acknowledged_at = req.at or now
+        wo.qc_acknowledged_at = ms_to_naive(req.at) or now
     wo.qc_checklist = _qc_blob(req, "DISAPPROVED")
     wo.status = "SUBMITTED"
     wo.updated_at = now

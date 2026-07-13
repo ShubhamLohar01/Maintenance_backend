@@ -745,7 +745,7 @@ class PmPlanRequest(_Trimmed):
     trigger_interval: int
     next_due_at: Optional[int] = None       # epoch ms (generator recomputes)
     last_completed_at: Optional[int] = None
-    assigned_technician_id: str             # = mt_users.id
+    assigned_technician_id: str             # = mt_users.id (name is resolved server-side from mt_users)
     is_active: bool = True
     created_by: Optional[str] = None
     created_at: Optional[int] = None        # epoch ms; defaults to server now on first insert
@@ -763,6 +763,7 @@ class PmPlanDto(BaseModel):
     next_due_at: Optional[int] = None
     last_completed_at: Optional[int] = None
     assigned_technician_id: str
+    assigned_technician_name: Optional[str] = None
     is_active: bool = True
     created_by: Optional[str] = None
     created_at: Optional[int] = None
