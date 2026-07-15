@@ -656,6 +656,8 @@ class OpenBreakdownDto(BaseModel):
     # Lifecycle transition times (epoch ms, null until they happen) — the app times
     # its reminder escalations off these; same clock/units as reported_at.
     acknowledged_at: Optional[int] = None    # technician acknowledged
+    acknowledged_by: Optional[str] = None    # = mt_users.id of the acknowledging technician (null on legacy rows acked before this column existed)
+    acknowledged_by_name: Optional[str] = None  # technician's name (always set once acknowledged, even on legacy rows)
     resolved_at: Optional[int] = None        # technician finished the repair (work-done)
     qc_acknowledged_at: Optional[int] = None # QC picked up the awaiting-QC ticket
     qc_decided_at: Optional[int] = None      # QC approved or disapproved
@@ -932,3 +934,96 @@ class MtUserUpdate(BaseModel):
     email_id: Optional[str] = None
     role: Optional[str] = None
     username: Optional[str] = None
+
+
+# --- Utility Consumption (Diesel / Gas / Electricity / Water) ---------------
+# The Android app fills the inputs, computes the derived values client-side, and
+# sends BOTH. `plant` accepts any spelling (normalized server-side to 'A-185' /
+# 'W-202'); `reading_date` is an ISO date 'YYYY-MM-DD'. All numerics are optional
+# so a partially-filled day still saves. DTOs add id + audit timestamps (ISO).
+
+class _UtilityBase(_Trimmed):
+    plant: str
+    # str (not `date`) on purpose: a missing/unparseable value must surface as a
+    # clean 400 from the handler (see utilities.py: _parse_reading_date), not a
+    # generic 422 from pydantic's date coercion.
+    reading_date: Optional[str] = None
+    created_by: Optional[str] = None  # ignored on input — backend stamps the authenticated user on first insert
+
+
+class UtilityDieselRequest(_UtilityBase):
+    initial_kwh_reading: Optional[float] = None
+    final_kwh_reading: Optional[float] = None
+    start_dg_run_hour: Optional[float] = None
+    stop_dg_run_hour: Optional[float] = None
+    diesel_l_per_hour: Optional[float] = 37.5
+    diesel_rate: Optional[float] = 95
+    diesel_received_l: Optional[float] = None
+    remark: Optional[str] = None
+    total_consumption: Optional[float] = None
+    total_run_hour: Optional[float] = None
+    total_diesel_l: Optional[float] = None
+    total_fuel_cost: Optional[float] = None
+
+
+class UtilityDieselDto(UtilityDieselRequest):
+    id: int
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class UtilityGasRequest(_UtilityBase):
+    gas_meter_opening: Optional[float] = None
+    gas_meter_closing: Optional[float] = None
+    gas_conversion_factor: Optional[float] = 1.44
+    gas_rate: Optional[float] = None
+    production_units: Optional[float] = None
+    remark: Optional[str] = None
+    gas_consumed_m3: Optional[float] = None
+    daily_gas_cost: Optional[float] = None
+    cost_per_unit: Optional[float] = None
+
+
+class UtilityGasDto(UtilityGasRequest):
+    id: int
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class UtilityElectricityRequest(_UtilityBase):
+    department: Optional[str] = None
+    energy_meter_opening_kwh: Optional[float] = None
+    energy_meter_closing_kwh: Optional[float] = None
+    energy_meter_opening_kvah: Optional[float] = None
+    energy_meter_closing_kvah: Optional[float] = None
+    ct_multiplier: Optional[float] = 4
+    electricity_rate: Optional[float] = None
+    production_units: Optional[float] = None
+    remark: Optional[str] = None
+    electricity_consumed_kwh: Optional[float] = None
+    electricity_consumed_kvah: Optional[float] = None
+    daily_electricity_cost: Optional[float] = None
+    cost_per_unit: Optional[float] = None
+
+
+class UtilityElectricityDto(UtilityElectricityRequest):
+    id: int
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class UtilityWaterRequest(_UtilityBase):
+    water_meter_opening: Optional[float] = None
+    water_meter_closing: Optional[float] = None
+    water_rate: Optional[float] = None
+    production_units: Optional[float] = None
+    remark: Optional[str] = None
+    water_consumed: Optional[float] = None
+    daily_water_cost: Optional[float] = None
+    cost_per_unit: Optional[float] = None
+
+
+class UtilityWaterDto(UtilityWaterRequest):
+    id: int
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None

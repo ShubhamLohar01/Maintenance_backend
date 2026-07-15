@@ -41,5 +41,16 @@ class Settings(BaseSettings):
     # Only read when fcm_enabled is true; sending is a no-op otherwise.
     fcm_credentials_file: str = ""
 
+    # --- In-process daily scheduler (see app/scheduler.py) ---
+    # Fires the Schedule Electric Assets sweep (generate_due_rows) once a day, so a
+    # scheduled asset's reading is written without anyone needing to open the app.
+    # Off switch for emergencies (bad power_load data flooding rows, etc.) — no
+    # redeploy needed, just flip the env var and restart.
+    scheduler_enabled: bool = True
+    # Hour (0-23, IST/Asia-Kolkata) the daily sweep fires. A day only counts once its
+    # OWN schedule window has ended (see generate_due_rows), so this should be set at
+    # or after the latest schedule_end_min in use, or simply left late (e.g. 21 = 9 PM).
+    scheduler_hour_ist: int = 21
+
 
 settings = Settings()

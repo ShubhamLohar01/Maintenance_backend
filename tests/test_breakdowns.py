@@ -158,6 +158,67 @@ def test_acknowledge_without_qc_checked_by_leaves_it_untouched(auth_client, db_s
     assert rec.qc_checked_by is None
 
 
+def test_acknowledge_stores_technician_id(auth_client, db_session):
+    _seed(db_session)
+    fid = _flag(auth_client)
+    auth_client.post(f"/breakdowns/{fid}/qc/acknowledge", json={
+        "user_id": "7", "user_name": "Ravi", "acknowledged_at": NOW})
+    rec = db_session.get(BreakdownRecord, int(fid))
+    db_session.refresh(rec)
+    assert rec.technician_id == "7"
+    assert rec.technician == "Ravi"
+
+
+def test_qc_pickup_does_not_touch_technician_id(auth_client, db_session):
+    """The dual-purpose endpoint's QC path (qc_checked_by set) must not stamp/clobber
+    the acknowledging technician's id — that's the technician-path's job only."""
+    _seed(db_session)
+    fid = _flag(auth_client)
+    auth_client.post(f"/breakdowns/{fid}/qc/acknowledge", json={
+        "user_id": "9", "user_name": "Amar", "qc_checked_by": "amar.yadav", "acknowledged_at": NOW})
+    rec = db_session.get(BreakdownRecord, int(fid))
+    db_session.refresh(rec)
+    assert rec.technician_id is None
+    assert rec.technician is None
+
+
+def test_open_returns_acknowledged_by_id_and_name(auth_client, db_session):
+    """The actual cross-device ask: a technician on a DIFFERENT phone must be able to
+    match 'my active tickets' by user id from GET /breakdowns/open, not just by name."""
+    _seed(db_session)
+    fid = _flag(auth_client)
+    auth_client.post(f"/breakdowns/{fid}/qc/acknowledge", json={
+        "user_id": "7", "user_name": "Ravi", "acknowledged_at": NOW})
+    row = next(x for x in auth_client.get("/breakdowns/open").json() if x["id"] == fid)
+    assert row["acknowledged_by"] == "7"
+    assert row["acknowledged_by_name"] == "Ravi"
+    assert row["acknowledged_at"] == NOW
+
+
+def test_open_acknowledged_by_null_before_acknowledge(auth_client, db_session):
+    _seed(db_session)
+    fid = _flag(auth_client)
+    row = next(x for x in auth_client.get("/breakdowns/open").json() if x["id"] == fid)
+    assert row["acknowledged_by"] is None
+    assert row["acknowledged_by_name"] is None
+    assert row["acknowledged_at"] is None
+
+
+def test_open_legacy_row_without_technician_id_returns_null_id_but_keeps_name(auth_client, db_session):
+    """Existing already-acknowledged rows (acknowledged before this column existed)
+    have technician set but technician_id NULL — must degrade gracefully, not error."""
+    _seed(db_session)
+    fid = _flag(auth_client)
+    rec = db_session.get(BreakdownRecord, int(fid))
+    rec.status = "ACKNOWLEDGED"
+    rec.technician = "Ravi"          # legacy: name only, no id ever stored
+    db_session.commit()
+
+    row = next(x for x in auth_client.get("/breakdowns/open").json() if x["id"] == fid)
+    assert row["acknowledged_by"] is None
+    assert row["acknowledged_by_name"] == "Ravi"
+
+
 def test_requires_auth_401(client):
     # Valid form body so only the missing auth (not body validation) can fail it.
     assert client.post("/breakdowns/flag", data={

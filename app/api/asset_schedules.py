@@ -11,6 +11,7 @@ from typing import List, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..database import get_rds
@@ -80,11 +81,46 @@ def _to_dto(a: MtAsset) -> AssetScheduleDto:
     )
 
 
+def _try_insert_schedule_row(
+    db: Session, asset: MtAsset, cursor, kwh: float,
+    client_run_id: str, started: datetime, ended: datetime,
+) -> bool:
+    """Insert one SCHEDULE row inside a SAVEPOINT. `client_run_id` is UNIQUE at the DB
+    level (see migrations/2026-07-15_daily_kwh_client_run_id_unique.sql), so if another
+    concurrent sweep — the 21:00 cron (app/scheduler.py) and a lazy on-read sweep can now
+    both fire independently — already inserted this exact (asset, day) a moment ago, this
+    raises IntegrityError. We catch it here so only THIS ONE ROW's SAVEPOINT rolls back;
+    the rest of the sweep (other assets/days already pending in the outer transaction)
+    is untouched. Returns True if this call inserted the row, False if it lost the race."""
+    try:
+        with db.begin_nested():
+            db.add(MachineDailyKwh(
+                machine_id=asset.asset_id,
+                reading_date=cursor,
+                building=asset.building or "W-202",
+                floor=asset.sub_location,
+                client_run_id=client_run_id,
+                operator_id=None,
+                operator_name="Scheduled",
+                started_at=started,
+                ended_at=ended,
+                status=_COMPLETE,
+                daily_kwh=kwh,
+                source=_SCHEDULE,
+            ))
+            db.flush()  # force the INSERT now, inside the SAVEPOINT, so a collision raises here
+        return True
+    except IntegrityError:
+        return False  # another sweep already recorded this (asset, day) — not an error
+
+
 def generate_due_rows(db: Session, now: Optional[datetime] = None) -> int:
     """Backfill missing daily consumption rows for every active electric-asset
     schedule, up to the latest window that has FULLY elapsed in IST. Idempotent
-    (keyed on client_run_id 'sched-{asset}-{date}'); safe to call on every read.
-    Returns the number of rows inserted."""
+    (keyed on client_run_id 'sched-{asset}-{date}', UNIQUE-constraint-backed — a
+    losing concurrent insert is caught and skipped, not crashed); safe to call on
+    every read AND from a concurrent scheduled trigger (app/scheduler.py).
+    Returns the number of rows actually inserted by THIS call."""
     now = now or datetime.now(IST)
     if now.tzinfo is None:
         now = now.replace(tzinfo=IST)
@@ -137,21 +173,10 @@ def generate_due_rows(db: Session, now: Optional[datetime] = None) -> int:
                 start_ist = datetime.combine(cursor, _minute_to_time(start_min), tzinfo=IST)
                 started = start_ist.astimezone(timezone.utc).replace(tzinfo=None)
                 ended = window_end_ist.astimezone(timezone.utc).replace(tzinfo=None)
-                db.add(MachineDailyKwh(
-                    machine_id=a.asset_id,
-                    reading_date=cursor,
-                    building=a.building or "W-202",
-                    floor=a.sub_location,
-                    client_run_id=client_run_id,
-                    operator_id=None,
-                    operator_name="Scheduled",
-                    started_at=started,
-                    ended_at=ended,
-                    status=_COMPLETE,
-                    daily_kwh=kwh,
-                    source=_SCHEDULE,
-                ))
-                inserted += 1
+                if _try_insert_schedule_row(db, a, cursor, kwh, client_run_id, started, ended):
+                    inserted += 1
+            # Either way this day is now recorded (by us, or by whichever sweep won
+            # the race) — advance past it so we never re-attempt it.
             last_done = cursor
             cursor += timedelta(days=1)
 

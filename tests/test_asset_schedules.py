@@ -3,6 +3,8 @@ lazy-backfilled into mt_machine_daily_kwh (source='SCHEDULE'). SUPERVISOR writes
 HEAD read-only. daily_kwh = rated_kw x window-hours x power_factor (0.99)."""
 from datetime import datetime, date
 
+import pytest
+
 from app.models import MtAsset, MachineDailyKwh
 from app.api.asset_schedules import generate_due_rows, IST
 
@@ -187,3 +189,66 @@ def test_clear_schedule_keeps_past_rows(login_as, db_session):
     assert r.status_code == 200
     assert r.json()["active"] is False and r.json()["start_min"] is None
     assert db_session.query(MachineDailyKwh).count() == before  # history untouched
+
+
+def test_concurrent_sweeps_never_double_insert_same_day(db_session):
+    """The real scenario this guards: the new 21:00 in-process cron (app/scheduler.py)
+    and a lazy on-read sweep (GET /asset-schedules) can now genuinely run at the same
+    moment, in two separate sessions. Both could pass the "does this row exist?"
+    application-level check before either commits (TOCTOU). Calling the low-level
+    insert twice with the SAME client_run_id in the SAME still-open transaction
+    reproduces exactly that: the DB's UNIQUE constraint (not just app logic) is what
+    actually stops the duplicate, and the second caller must lose gracefully — no
+    crash, no second row — exactly like a losing concurrent sweep would."""
+    from app.api.asset_schedules import _try_insert_schedule_row
+
+    _seed(db_session, power="1000Watt")
+    asset = db_session.query(MtAsset).filter(MtAsset.asset_id == "A185-LIGHT1").first()
+    d = date(2026, 7, 5)
+    started = datetime(2026, 7, 5, 4, 30)
+    ended = datetime(2026, 7, 5, 14, 30)
+    client_run_id = f"sched-{asset.asset_id}-{d.isoformat()}"
+
+    winner = _try_insert_schedule_row(db_session, asset, d, 9.9, client_run_id, started, ended)
+    loser = _try_insert_schedule_row(db_session, asset, d, 9.9, client_run_id, started, ended)
+    db_session.commit()  # the outer transaction must still be healthy after the collision
+
+    assert winner is True
+    assert loser is False                        # lost the race — no exception raised
+    rows = db_session.query(MachineDailyKwh).filter(
+        MachineDailyKwh.client_run_id == client_run_id).all()
+    assert len(rows) == 1                         # exactly one row — never doubled
+
+    # The outer session/transaction is still usable afterward (the SAVEPOINT rollback
+    # didn't poison the rest of the sweep for other assets/days).
+    _seed(db_session, asset_id="A185-LIGHT2", power="1000Watt")
+    asset2 = db_session.query(MtAsset).filter(MtAsset.asset_id == "A185-LIGHT2").first()
+    ok = _try_insert_schedule_row(
+        db_session, asset2, d, 5.0, f"sched-A185-LIGHT2-{d.isoformat()}", started, ended)
+    db_session.commit()
+    assert ok is True
+    assert db_session.query(MachineDailyKwh).count() == 2
+
+
+def test_client_run_id_is_unique_at_db_level(db_session):
+    """The constraint itself — proves the safety net is a real DB guarantee, not just
+    the application's "check then insert" logic (which alone is race-prone)."""
+    from sqlalchemy.exc import IntegrityError
+
+    db_session.add(MachineDailyKwh(
+        machine_id="A185-1", reading_date=date(2026, 7, 5), building="A-185",
+        client_run_id="sched-A185-1-2026-07-05", status="COMPLETE",
+        daily_kwh=1.0, source="SCHEDULE",
+    ))
+    db_session.commit()
+
+    db_session.add(MachineDailyKwh(
+        machine_id="A185-1", reading_date=date(2026, 7, 5), building="A-185",
+        client_run_id="sched-A185-1-2026-07-05",  # same key -> must violate the constraint
+        status="COMPLETE", daily_kwh=1.0, source="SCHEDULE",
+    ))
+    try:
+        with pytest.raises(IntegrityError):
+            db_session.commit()
+    finally:
+        db_session.rollback()

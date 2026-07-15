@@ -148,7 +148,7 @@ class MachineDailyKwh(RdsBase):
     building:      Mapped[str]             = mapped_column(String(16), default="W-202", server_default="W-202")
     floor:         Mapped[str | None]      = mapped_column(String(64), nullable=True)
     # --- run / lifecycle (folded in from the retired mt_machine_runs) ---
-    client_run_id: Mapped[str | None]      = mapped_column(String(64), index=True, nullable=True)  # idempotency key from the app
+    client_run_id: Mapped[str | None]      = mapped_column(String(64), unique=True, index=True, nullable=True)  # idempotency key (SCHEDULE rows: 'sched-{asset}-{date}'; RUN rows: NULL, see MtMachineRunSegment). UNIQUE so concurrent sweeps can never double-insert the same day.
     operator_id:   Mapped[str | None]      = mapped_column(String(64), index=True, nullable=True)  # = str(mt_users.id)
     operator_name: Mapped[str | None]      = mapped_column(String(128), nullable=True)             # denormalized snapshot
     started_at:    Mapped[datetime | None] = mapped_column(DateTime, index=True, nullable=True)
@@ -286,7 +286,9 @@ class MachineTransfer(RdsBase):
 class BreakdownRecord(RdsBase):
     """One live breakdown event: operator raises -> technician acknowledges &
     repairs -> QC approves/rejects. People are stored as names (resolved from
-    mt_users at write time). The machine is usable again only when status=CLOSED."""
+    mt_users at write time); the acknowledging technician also gets `technician_id`
+    (mt_users.id) so GET /breakdowns/open can match "my active tickets" by id across
+    devices, not just by name. The machine is usable again only when status=CLOSED."""
     __tablename__ = "mt_breakdown_records"
 
     id:                     Mapped[int]             = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -300,6 +302,7 @@ class BreakdownRecord(RdsBase):
     # OPEN | ACKNOWLEDGED | PENDING_QC | CLOSED | REOPENED (machine usable only when CLOSED)
     status:                 Mapped[str | None]      = mapped_column(String(16), index=True, nullable=True)
     technician:             Mapped[str | None]      = mapped_column(String(128), nullable=True)
+    technician_id:          Mapped[str | None]      = mapped_column(String(64), nullable=True)                 # = mt_users.id (acknowledger); added via manual ALTER TABLE — legacy rows NULL, name-only
     ackn_at:                Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     work_done_des:          Mapped[str | None]      = mapped_column(Text, nullable=True)
     photo_url:              Mapped[str | None]      = mapped_column(Text, nullable=True)
@@ -456,3 +459,122 @@ class MtPmWorkOrder(RdsBase):
             name="ck_pm_wo_status",
         ),
     )
+
+
+# ============================================================================
+# Utility Consumption (Diesel / Gas / Electricity / Water) — one row per
+# (plant, reading_date). Sourced from the "Utility Consumption 2026-2027" sheet
+# (A-185 + W-202 blocks folded into `plant`). The derived columns mirror the
+# sheet's per-column formulas but are PLAIN (not GENERATED): the Android app
+# computes them client-side and sends them; the backend stores what it receives
+# (see app/api/utilities.py). All money columns are in rupees.
+# ============================================================================
+
+class MtUtilityDiesel(RdsBase):
+    """DG-set daily diesel + energy log. Formulas (app-computed):
+    total_consumption = final_kwh - initial_kwh; total_run_hour = stop - start;
+    total_diesel_l = diesel_l_per_hour * total_run_hour;
+    total_fuel_cost = total_diesel_l * diesel_rate."""
+    __tablename__ = "mt_utility_diesel"
+
+    id:                  Mapped[int]              = mapped_column(Integer, primary_key=True, autoincrement=True)
+    plant:               Mapped[str]              = mapped_column(String(16), index=True)   # 'A-185' | 'W-202'
+    reading_date:        Mapped[date]             = mapped_column(Date, index=True)
+    initial_kwh_reading: Mapped[Decimal | None]   = mapped_column(Numeric(14, 2), nullable=True)
+    final_kwh_reading:   Mapped[Decimal | None]   = mapped_column(Numeric(14, 2), nullable=True)
+    start_dg_run_hour:   Mapped[Decimal | None]   = mapped_column(Numeric(10, 2), nullable=True)
+    stop_dg_run_hour:    Mapped[Decimal | None]   = mapped_column(Numeric(10, 2), nullable=True)
+    diesel_l_per_hour:   Mapped[Decimal | None]   = mapped_column(Numeric(10, 3), nullable=True, server_default="37.5")
+    diesel_rate:         Mapped[Decimal | None]   = mapped_column(Numeric(10, 2), nullable=True, server_default="95")
+    diesel_received_l:   Mapped[Decimal | None]   = mapped_column(Numeric(12, 2), nullable=True)
+    remark:              Mapped[str | None]       = mapped_column(Text, nullable=True)
+    total_consumption:   Mapped[Decimal | None]   = mapped_column(Numeric(14, 2), nullable=True)   # app-computed
+    total_run_hour:      Mapped[Decimal | None]   = mapped_column(Numeric(10, 2), nullable=True)   # app-computed
+    total_diesel_l:      Mapped[Decimal | None]   = mapped_column(Numeric(14, 3), nullable=True)   # app-computed
+    total_fuel_cost:     Mapped[Decimal | None]   = mapped_column(Numeric(16, 2), nullable=True)   # app-computed
+    created_by:          Mapped[str | None]       = mapped_column(String(64), nullable=True)
+    created_at:          Mapped[datetime]         = mapped_column(DateTime, server_default=func.now())
+    updated_at:          Mapped[datetime]         = mapped_column(DateTime, server_default=func.now())
+
+    __table_args__ = (UniqueConstraint("plant", "reading_date", name="uq_utility_diesel"),)
+
+
+class MtUtilityGas(RdsBase):
+    """Daily gas log. Formulas (app-computed):
+    gas_consumed_m3 = (closing - opening) * gas_conversion_factor;
+    daily_gas_cost = gas_consumed_m3 * gas_rate;
+    cost_per_unit = daily_gas_cost / production_units (null when production 0/blank)."""
+    __tablename__ = "mt_utility_gas"
+
+    id:                    Mapped[int]            = mapped_column(Integer, primary_key=True, autoincrement=True)
+    plant:                 Mapped[str]            = mapped_column(String(16), index=True)
+    reading_date:          Mapped[date]           = mapped_column(Date, index=True)
+    gas_meter_opening:     Mapped[Decimal | None] = mapped_column(Numeric(14, 3), nullable=True)
+    gas_meter_closing:     Mapped[Decimal | None] = mapped_column(Numeric(14, 3), nullable=True)
+    gas_conversion_factor: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True, server_default="1.44")
+    gas_rate:              Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    production_units:      Mapped[Decimal | None] = mapped_column(Numeric(14, 3), nullable=True)
+    remark:                Mapped[str | None]     = mapped_column(Text, nullable=True)
+    gas_consumed_m3:       Mapped[Decimal | None] = mapped_column(Numeric(16, 4), nullable=True)   # app-computed
+    daily_gas_cost:        Mapped[Decimal | None] = mapped_column(Numeric(16, 4), nullable=True)   # app-computed
+    cost_per_unit:         Mapped[Decimal | None] = mapped_column(Numeric(16, 4), nullable=True)   # app-computed
+    created_by:            Mapped[str | None]     = mapped_column(String(64), nullable=True)
+    created_at:            Mapped[datetime]       = mapped_column(DateTime, server_default=func.now())
+    updated_at:            Mapped[datetime]       = mapped_column(DateTime, server_default=func.now())
+
+    __table_args__ = (UniqueConstraint("plant", "reading_date", name="uq_utility_gas"),)
+
+
+class MtUtilityElectricity(RdsBase):
+    """Daily electricity log (kWh + KVAH). Formulas (app-computed):
+    electricity_consumed_kwh = (closing_kwh - opening_kwh) * ct_multiplier;
+    electricity_consumed_kvah = closing_kvah - opening_kvah;
+    daily_electricity_cost = electricity_consumed_kwh * electricity_rate;
+    cost_per_unit = daily_electricity_cost / production_units (null when production 0/blank)."""
+    __tablename__ = "mt_utility_electricity"
+
+    id:                        Mapped[int]            = mapped_column(Integer, primary_key=True, autoincrement=True)
+    plant:                     Mapped[str]            = mapped_column(String(16), index=True)
+    reading_date:              Mapped[date]           = mapped_column(Date, index=True)
+    department:                Mapped[str | None]     = mapped_column(String(64), nullable=True)
+    energy_meter_opening_kwh:  Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    energy_meter_closing_kwh:  Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    energy_meter_opening_kvah: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    energy_meter_closing_kvah: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    ct_multiplier:             Mapped[Decimal | None] = mapped_column(Numeric(8, 3), nullable=True, server_default="4")
+    electricity_rate:          Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    production_units:          Mapped[Decimal | None] = mapped_column(Numeric(14, 3), nullable=True)
+    remark:                    Mapped[str | None]     = mapped_column(Text, nullable=True)
+    electricity_consumed_kwh:  Mapped[Decimal | None] = mapped_column(Numeric(16, 3), nullable=True)   # app-computed
+    electricity_consumed_kvah: Mapped[Decimal | None] = mapped_column(Numeric(16, 3), nullable=True)   # app-computed
+    daily_electricity_cost:    Mapped[Decimal | None] = mapped_column(Numeric(16, 2), nullable=True)   # app-computed
+    cost_per_unit:             Mapped[Decimal | None] = mapped_column(Numeric(16, 4), nullable=True)   # app-computed
+    created_by:                Mapped[str | None]     = mapped_column(String(64), nullable=True)
+    created_at:                Mapped[datetime]       = mapped_column(DateTime, server_default=func.now())
+    updated_at:                Mapped[datetime]       = mapped_column(DateTime, server_default=func.now())
+
+    __table_args__ = (UniqueConstraint("plant", "reading_date", name="uq_utility_electricity"),)
+
+
+class MtUtilityWater(RdsBase):
+    """Daily water log. Formulas (app-computed):
+    water_consumed = closing - opening; daily_water_cost = water_consumed * water_rate;
+    cost_per_unit = daily_water_cost / production_units (null when production 0/blank)."""
+    __tablename__ = "mt_utility_water"
+
+    id:                  Mapped[int]              = mapped_column(Integer, primary_key=True, autoincrement=True)
+    plant:               Mapped[str]              = mapped_column(String(16), index=True)
+    reading_date:        Mapped[date]             = mapped_column(Date, index=True)
+    water_meter_opening: Mapped[Decimal | None]   = mapped_column(Numeric(14, 3), nullable=True)
+    water_meter_closing: Mapped[Decimal | None]   = mapped_column(Numeric(14, 3), nullable=True)
+    water_rate:          Mapped[Decimal | None]   = mapped_column(Numeric(10, 4), nullable=True)
+    production_units:    Mapped[Decimal | None]   = mapped_column(Numeric(14, 3), nullable=True)
+    remark:              Mapped[str | None]       = mapped_column(Text, nullable=True)
+    water_consumed:      Mapped[Decimal | None]   = mapped_column(Numeric(16, 3), nullable=True)   # app-computed
+    daily_water_cost:    Mapped[Decimal | None]   = mapped_column(Numeric(16, 2), nullable=True)   # app-computed
+    cost_per_unit:       Mapped[Decimal | None]   = mapped_column(Numeric(16, 4), nullable=True)   # app-computed
+    created_by:          Mapped[str | None]       = mapped_column(String(64), nullable=True)
+    created_at:          Mapped[datetime]         = mapped_column(DateTime, server_default=func.now())
+    updated_at:          Mapped[datetime]         = mapped_column(DateTime, server_default=func.now())
+
+    __table_args__ = (UniqueConstraint("plant", "reading_date", name="uq_utility_water"),)

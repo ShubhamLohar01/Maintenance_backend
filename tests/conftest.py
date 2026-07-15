@@ -12,6 +12,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.config import settings
+
+# Never run the in-process daily scheduler in tests — it would open a real RDS session
+# (SessionRds, bypassing the get_rds test override) outside any test's control. Must be
+# set before `from app.main import app` below, since create_app() registers the FastAPI
+# startup hook that reads this flag when it (may) fire.
+settings.scheduler_enabled = False
+
 from app.database import get_rds
 from app.auth import get_current_user
 from app.main import app
@@ -25,6 +33,10 @@ from app.models import (
     MtFloorUtilityReading,
     MtDeviceToken,
     MachineTransfer,
+    MtUtilityDiesel,
+    MtUtilityGas,
+    MtUtilityElectricity,
+    MtUtilityWater,
 )
 
 # RdsBase tables the suite needs (all SQLite-compatible — no JSONB columns).
@@ -38,6 +50,10 @@ _TABLES = [
     MtFloorUtilityReading,
     MtDeviceToken,
     MachineTransfer,
+    MtUtilityDiesel,
+    MtUtilityGas,
+    MtUtilityElectricity,
+    MtUtilityWater,
 ]
 
 

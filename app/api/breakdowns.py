@@ -159,6 +159,7 @@ def acknowledge(
     else:
         rec.status = "ACKNOWLEDGED"
         rec.technician = req.user_name or _resolve_name(db, req.user_id) or user.name
+        rec.technician_id = req.user_id
         rec.ackn_at = _ms_to_naive(req.acknowledged_at)
     db.commit()
     return QcUpdateResponse(
@@ -297,6 +298,8 @@ def list_open_breakdowns(
             status=r.status or "OPEN",
             reported_at=to_epoch_ms(r.start_time),
             acknowledged_at=to_epoch_ms(r.ackn_at),
+            acknowledged_by=r.technician_id,
+            acknowledged_by_name=r.technician,
             resolved_at=to_epoch_ms(r.resolved_at),
             qc_acknowledged_at=to_epoch_ms(r.qc_acknowledged_at),
             qc_decided_at=to_epoch_ms(r.qc_decided_at),

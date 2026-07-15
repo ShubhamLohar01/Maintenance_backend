@@ -12,3 +12,4 @@ pytest==8.3.4
 psycopg2-binary==2.9.10
 boto3==1.35.71
 firebase-admin==6.5.0  # FCM push: needs FCM_ENABLED=true + FCM_CREDENTIALS_FILE to actually send (see app/notifications/fanout.py)
+apscheduler==3.10.4  # in-process daily cron (see app/scheduler.py) — no external cron infra needed

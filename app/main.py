@@ -1,4 +1,5 @@
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -6,11 +7,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .database import LocalBase, RdsBase, local_engine, rds_engine
+from .scheduler import start_scheduler, stop_scheduler
 from .api import (
     auth, machines, energy, breakdowns, floors, mt_machines,
     preventive_maintenance, machine_transfers, breakdown_records,
     live, reports, head, floor_readings, asset_schedules, devices,
-    users, pm_plans, pm_work_orders, mt_users,
+    users, pm_plans, pm_work_orders, mt_users, utilities,
 )
 
 
@@ -64,12 +66,19 @@ def create_app() -> FastAPI:
             "RDS endpoints will work once connectivity returns.", type(exc).__name__
         )
 
+    @asynccontextmanager
+    async def _lifespan(_: FastAPI):
+        start_scheduler()
+        yield
+        stop_scheduler()
+
     app = FastAPI(
         title="FactoryOps Maintenance Backend",
         version="0.1.0",
         description="Backend for the FactoryOps Phase-1 mobile app "
                     "(Power Consumption + Breakdowns + Floor utility data).",
         debug=False,  # never render HTML tracebacks to API clients
+        lifespan=_lifespan,
     )
 
     # Catch-all so any unhandled exception returns JSON, never an HTML debug page.
@@ -111,6 +120,7 @@ def create_app() -> FastAPI:
     app.include_router(mt_users.router)
     app.include_router(pm_plans.router)
     app.include_router(pm_work_orders.router)
+    app.include_router(utilities.router)
 
     @app.get("/health", tags=["meta"])
     def health():
