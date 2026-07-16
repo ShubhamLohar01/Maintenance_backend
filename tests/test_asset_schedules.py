@@ -113,6 +113,81 @@ def test_unknown_asset_404(login_as, db_session):
                  json={"start_min": 600, "end_min": 1200}).status_code == 404
 
 
+# ---- weekday toggles + 24h flag ---------------------------------------------
+
+def test_put_stores_and_returns_days_and_is_24h(login_as, db_session):
+    c = login_as(role="SUPERVISOR", location="A-185")
+    _seed(db_session, power="1000Watt")
+    body = c.put("/asset-schedules/A185-LIGHT1",
+                 json={"start_min": 0, "end_min": 1440, "active": True,
+                       "days": ["MON", "WED", "FRI"], "is_24h": True}).json()
+    assert body["days"] == ["MON", "WED", "FRI"]
+    assert body["is_24h"] is True
+
+    # GET reflects the same stored values (pre-fills the editor)
+    rows = c.get("/asset-schedules").json()
+    light = next(r for r in rows if r["asset_id"] == "A185-LIGHT1")
+    assert light["days"] == ["MON", "WED", "FRI"]
+    assert light["is_24h"] is True
+
+
+def test_days_and_is_24h_default_absent_and_false(auth_client, db_session):
+    _seed(db_session, "A185-LIGHT1")  # no schedule set at all
+    light = next(r for r in auth_client.get("/asset-schedules").json()
+                 if r["asset_id"] == "A185-LIGHT1")
+    assert light["days"] is None            # omitted/null -> app treats as every day
+    assert light["is_24h"] is False
+
+
+def test_unknown_day_code_rejected_400(login_as, db_session):
+    c = login_as(role="SUPERVISOR")
+    _seed(db_session)
+    r = c.put("/asset-schedules/A185-LIGHT1",
+              json={"start_min": 600, "end_min": 1200, "days": ["FOO"]})
+    assert r.status_code == 400
+
+
+def test_clear_schedule_resets_days_and_is_24h(login_as, db_session):
+    c = login_as(role="SUPERVISOR")
+    _seed(db_session, power="1000Watt")
+    c.put("/asset-schedules/A185-LIGHT1",
+          json={"start_min": 0, "end_min": 1440, "days": ["MON"], "is_24h": True})
+    body = c.delete("/asset-schedules/A185-LIGHT1").json()
+    assert body["days"] is None
+    assert body["is_24h"] is False
+
+
+def test_generator_skips_days_not_in_schedule(db_session):
+    _seed(db_session, power="1000Watt")
+    a = _set_schedule(db_session, "A185-LIGHT1", 600, 1200, last_generated=date(2026, 7, 1))
+    a.schedule_days = "FRI"  # 2026-07-01 is a Wednesday; only 7/3 (Fri) qualifies
+    db_session.commit()
+    now = datetime(2026, 7, 4, 23, 0, tzinfo=IST)  # 7/2 Thu, 7/3 Fri, 7/4 Sat all elapsed
+    assert generate_due_rows(db_session, now=now) == 1
+    rows = db_session.query(MachineDailyKwh).filter(MachineDailyKwh.source == "SCHEDULE").all()
+    assert len(rows) == 1
+    assert rows[0].reading_date == date(2026, 7, 3)
+    a2 = db_session.query(MtAsset).filter(MtAsset.asset_id == "A185-LIGHT1").first()
+    assert a2.schedule_last_generated == date(2026, 7, 4)  # high-water mark still advances
+
+
+def test_generator_is_24h_ignores_stored_start_end_minutes(db_session):
+    _seed(db_session, power="1000Watt")  # 1 kW
+    a = _set_schedule(db_session, "A185-LIGHT1", 600, 1200, last_generated=date(2026, 7, 1))
+    a.schedule_is_24h = True
+    db_session.commit()
+    # Stored end_min=1200 (20:00) would look elapsed well before midnight; is_24h means
+    # the true window is the full day, so 21:00 on 7/2 must NOT count it as done yet.
+    still_within_day = datetime(2026, 7, 2, 21, 0, tzinfo=IST)
+    assert generate_due_rows(db_session, now=still_within_day) == 0
+
+    after_midnight = datetime(2026, 7, 3, 0, 30, tzinfo=IST)
+    assert generate_due_rows(db_session, now=after_midnight) == 1
+    row = db_session.query(MachineDailyKwh).filter(MachineDailyKwh.source == "SCHEDULE").one()
+    assert row.reading_date == date(2026, 7, 2)
+    assert abs(float(row.daily_kwh) - 23.76) < 1e-6  # 1 kW * 24 h * 0.99, not the stored 10 h
+
+
 # ---- backfill generation ---------------------------------------------------
 
 def test_backfill_generates_elapsed_days_only(db_session):
@@ -129,6 +204,7 @@ def test_backfill_generates_elapsed_days_only(db_session):
     # high-water mark advanced
     a = db_session.query(MtAsset).filter(MtAsset.asset_id == "A185-LIGHT1").first()
     assert a.schedule_last_generated == date(2026, 7, 4)
+    assert all(r.asset_name == "Tubelight" for r in rows)  # denormalized snapshot
 
 
 def test_backfill_is_idempotent(db_session):

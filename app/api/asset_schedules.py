@@ -28,21 +28,61 @@ IST = ZoneInfo("Asia/Kolkata")
 _SCHEDULE = "SCHEDULE"
 _COMPLETE = "COMPLETE"
 _DAY_MINUTES = 24 * 60
+# date.weekday(): 0=Monday..6=Sunday
+_WEEKDAY_CODES = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+_VALID_DAYS = set(_WEEKDAY_CODES)
 
 
-def _hours(start_min: Optional[int], end_min: Optional[int]) -> float:
+def _hours(start_min: Optional[int], end_min: Optional[int], is_24h: bool = False) -> float:
+    if is_24h:
+        return 24.0
     if start_min is None or end_min is None:
         return 0.0
     return max(0.0, (end_min - start_min) / 60.0)
 
 
-def _est_kwh(rated_kw: Optional[float], start_min: Optional[int], end_min: Optional[int]) -> Optional[float]:
+def _est_kwh(
+    rated_kw: Optional[float], start_min: Optional[int], end_min: Optional[int], is_24h: bool = False,
+) -> Optional[float]:
     if not rated_kw:
         return None
-    hrs = _hours(start_min, end_min)
+    hrs = _hours(start_min, end_min, is_24h)
     if hrs <= 0:
         return None
     return round(rated_kw * hrs * settings.power_factor, 3)
+
+
+def _encode_days(days: Optional[List[str]]) -> Optional[str]:
+    """App's ["MON","WED",...] -> comma-separated storage string; None/empty -> None
+    (every day). 400 on any code outside SUN..SAT."""
+    if not days:
+        return None
+    codes = []
+    for d in days:
+        code = (d or "").strip().upper()
+        if code not in _VALID_DAYS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown day code {d!r} (expected one of {sorted(_VALID_DAYS)})",
+            )
+        codes.append(code)
+    return ",".join(codes)
+
+
+def _decode_days(raw: Optional[str]) -> Optional[List[str]]:
+    if not raw or not raw.strip():
+        return None
+    return raw.split(",")
+
+
+def _window_end_ist(cursor, end_min: int) -> datetime:
+    """end_min==1440 (full/24h day) means the window ends at the NEXT day's midnight,
+    not `cursor`'s own 00:00 — _minute_to_time(1440) wraps to time(0, 0), which is the
+    START of `cursor`. Getting this wrong made a full-day window look 'elapsed' the
+    instant its day began instead of after it ended."""
+    if end_min >= _DAY_MINUTES:
+        return datetime.combine(cursor + timedelta(days=1), time_cls(0, 0), tzinfo=IST)
+    return datetime.combine(cursor, _minute_to_time(end_min), tzinfo=IST)
 
 
 def _minute_to_time(m: int) -> time_cls:
@@ -61,6 +101,7 @@ def _fmt_label(m: Optional[int]) -> Optional[str]:
 
 def _to_dto(a: MtAsset) -> AssetScheduleDto:
     rated = parse_kw(a.power_load) or None
+    is_24h = bool(a.schedule_is_24h)
     return AssetScheduleDto(
         asset_id=a.asset_id or str(a.id),
         asset_name=a.asset_name,
@@ -74,8 +115,10 @@ def _to_dto(a: MtAsset) -> AssetScheduleDto:
         start_label=_fmt_label(a.schedule_start_min),
         end_label=_fmt_label(a.schedule_end_min),
         active=bool(a.schedule_active),
-        hours=round(_hours(a.schedule_start_min, a.schedule_end_min), 2),
-        est_daily_kwh=_est_kwh(rated, a.schedule_start_min, a.schedule_end_min),
+        days=_decode_days(a.schedule_days),
+        is_24h=is_24h,
+        hours=round(_hours(a.schedule_start_min, a.schedule_end_min, is_24h), 2),
+        est_daily_kwh=_est_kwh(rated, a.schedule_start_min, a.schedule_end_min, is_24h),
         updated_by=a.schedule_updated_by,
         updated_at=iso_z(a.schedule_updated_at),
     )
@@ -99,6 +142,7 @@ def _try_insert_schedule_row(
                 reading_date=cursor,
                 building=asset.building or "W-202",
                 floor=asset.sub_location,
+                asset_name=asset.asset_name,
                 client_run_id=client_run_id,
                 operator_id=None,
                 operator_name="Scheduled",
@@ -140,11 +184,15 @@ def generate_due_rows(db: Session, now: Optional[datetime] = None) -> int:
     inserted = 0
     for a in schedules:
         rated_kw = parse_kw(a.power_load)
-        start_min, end_min = a.schedule_start_min, a.schedule_end_min
+        is_24h = bool(a.schedule_is_24h)
+        # is_24h ignores whatever start_min/end_min happen to be stored — the window
+        # is the full day, full stop (the app sends 0/1440 for these, but don't rely on it).
+        start_min, end_min = (0, _DAY_MINUTES) if is_24h else (a.schedule_start_min, a.schedule_end_min)
+        allowed_days = _decode_days(a.schedule_days)  # None = every day
         # No power draw or an invalid window -> nothing meaningful to record.
         if not rated_kw or end_min <= start_min:
             continue
-        kwh = round(rated_kw * _hours(start_min, end_min) * settings.power_factor, 3)
+        kwh = round(rated_kw * _hours(start_min, end_min, is_24h) * settings.power_factor, 3)
 
         # Resume the day after the last generated date; for a fresh schedule start
         # from the day it was set (so we never backdate before the supervisor set it).
@@ -157,9 +205,16 @@ def generate_due_rows(db: Session, now: Optional[datetime] = None) -> int:
         last_done = a.schedule_last_generated
         while cursor <= today:
             # Only record a day once its window end has passed (IST).
-            window_end_ist = datetime.combine(cursor, _minute_to_time(end_min), tzinfo=IST)
+            window_end_ist = _window_end_ist(cursor, end_min)
             if window_end_ist > now.astimezone(IST):
                 break
+
+            if allowed_days is not None and _WEEKDAY_CODES[cursor.weekday()] not in allowed_days:
+                # Not a scheduled weekday — skip generating a row, but still advance
+                # past it so it's never re-attempted on the next sweep.
+                last_done = cursor
+                cursor += timedelta(days=1)
+                continue
 
             client_run_id = f"sched-{a.asset_id}-{cursor.isoformat()}"
             exists = (
@@ -243,10 +298,13 @@ def upsert_asset_schedule(
             status_code=400,
             detail="Require 0 <= start_min < end_min <= 1440 (same-day window)",
         )
+    encoded_days = _encode_days(payload.days)  # 400 here on an unknown day code
 
     a.schedule_start_min = payload.start_min
     a.schedule_end_min = payload.end_min
     a.schedule_active = payload.active
+    a.schedule_days = encoded_days
+    a.schedule_is_24h = payload.is_24h
     a.schedule_updated_by = user.username
     a.schedule_updated_at = datetime.utcnow()
     db.commit()
@@ -269,6 +327,8 @@ def clear_asset_schedule(
     a.schedule_start_min = None
     a.schedule_end_min = None
     a.schedule_active = False
+    a.schedule_days = None
+    a.schedule_is_24h = False
     a.schedule_updated_by = user.username
     a.schedule_updated_at = datetime.utcnow()
     db.commit()

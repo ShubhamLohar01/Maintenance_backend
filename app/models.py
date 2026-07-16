@@ -107,6 +107,11 @@ class MtAsset(RdsBase):
     schedule_start_min:      Mapped[int | None]      = mapped_column(Integer, nullable=True)   # 0..1439, e.g. 600 = 10:00
     schedule_end_min:        Mapped[int | None]      = mapped_column(Integer, nullable=True)   # must be > start (same-day window)
     schedule_active:         Mapped[bool]            = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # Comma-separated 3-letter weekday codes (SUN..SAT), e.g. "MON,WED,FRI"; NULL/empty = every
+    # day (keeps old rows firing daily). Plain TEXT (not JSON/JSONB) so it stays portable to
+    # the SQLite test harness — see app/api/asset_schedules.py _encode_days/_decode_days.
+    schedule_days:           Mapped[str | None]      = mapped_column(String(32), nullable=True)
+    schedule_is_24h:         Mapped[bool]            = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     schedule_last_generated: Mapped[date | None]     = mapped_column(Date, nullable=True)      # backfill high-water mark
     schedule_updated_by:     Mapped[str | None]      = mapped_column(String(128), nullable=True)
     schedule_updated_at:     Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -147,6 +152,7 @@ class MachineDailyKwh(RdsBase):
     reading_date:  Mapped[date]            = mapped_column(Date, index=True)        # = started_at calendar day
     building:      Mapped[str]             = mapped_column(String(16), default="W-202", server_default="W-202")
     floor:         Mapped[str | None]      = mapped_column(String(64), nullable=True)
+    asset_name:    Mapped[str | None]      = mapped_column(String(255), nullable=True)  # denormalized snapshot from mt_asset_list
     # --- run / lifecycle (folded in from the retired mt_machine_runs) ---
     client_run_id: Mapped[str | None]      = mapped_column(String(64), unique=True, index=True, nullable=True)  # idempotency key (SCHEDULE rows: 'sched-{asset}-{date}'; RUN rows: NULL, see MtMachineRunSegment). UNIQUE so concurrent sweeps can never double-insert the same day.
     operator_id:   Mapped[str | None]      = mapped_column(String(64), index=True, nullable=True)  # = str(mt_users.id)

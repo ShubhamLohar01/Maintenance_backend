@@ -57,6 +57,8 @@ def test_start_creates_one_daily_row_and_active_lists_stoppable_run(auth_client,
     assert it["started_at"] > 1_000_000_000_000
     assert abs(it["started_at"] - _ms(started)) < 2000
 
+    assert db_session.query(MachineDailyKwh).one().asset_name == "Sealer"  # denormalized snapshot
+
     stop = _stop(auth_client, run_id, started + timedelta(hours=1))
     assert stop.status_code == 200, stop.text
     assert stop.json()["run_id"] == run_id

@@ -225,6 +225,8 @@ class AssetScheduleDto(BaseModel):
     start_label: Optional[str] = None  # readable 12h form of start_min, e.g. "10:00 AM"
     end_label: Optional[str] = None    # readable 12h form of end_min, e.g. "7:00 PM"
     active: bool = False
+    days: Optional[List[str]] = None   # 3-letter weekday codes (SUN..SAT); null/absent = every day
+    is_24h: bool = False               # when true, the window is the full day regardless of start_min/end_min
     hours: float = 0.0
     est_daily_kwh: Optional[float] = None
     updated_by: Optional[str] = None
@@ -237,6 +239,8 @@ class AssetScheduleUpsertRequest(_Trimmed):
     start_min: int
     end_min: int
     active: bool = True
+    days: Optional[List[str]] = None   # 3-letter weekday codes (SUN..SAT); absent/empty = every day
+    is_24h: bool = False
 
 
 class FloorSummaryDto(BaseModel):

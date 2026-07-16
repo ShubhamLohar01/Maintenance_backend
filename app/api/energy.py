@@ -226,6 +226,7 @@ def start_run(
             reading_date=run_date,
             building=asset.building,
             floor=asset.sub_location,
+            asset_name=asset.asset_name,
             operator_id=str(user.id),
             operator_name=user.name,
             started_at=started,
