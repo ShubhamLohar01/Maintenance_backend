@@ -1,5 +1,7 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import List
+from zoneinfo import ZoneInfo
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -14,6 +16,16 @@ from ..auth import get_current_user
 from ..utils import building_for, scoped_buildings
 
 router = APIRouter(prefix="/floor-readings", tags=["floor-readings"])
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def _default_reading_date() -> date:
+    """No explicit date -> yesterday (IST). A technician's 'Daily Reading' round
+    reports the PREVIOUS day's full consumption — today's isn't over yet, so
+    defaulting to today (as this used to) always undercounted the current day's
+    still-in-progress runs."""
+    return (datetime.now(IST) - timedelta(days=1)).date()
 
 
 def _resolve_building(user, requested: str | None, *, allow_default: bool) -> str:
@@ -67,14 +79,15 @@ def _system_by_floor(db: Session, building: str, on: date) -> dict[str, float]:
 
 @router.get("/system", response_model=FloorReadingsResponse)
 def fetch_system_readings(
-    date_: str | None = Query(None, alias="date", description="ISO YYYY-MM-DD; defaults to today"),
+    date_: str | None = Query(None, alias="date", description="ISO YYYY-MM-DD; defaults to yesterday"),
     building_: str | None = Query(None, alias="building", description="A-185 / W-202; required for HEAD/SUPERVISOR"),
     db: Session = Depends(get_rds),
     user: User = Depends(get_current_user),
 ):
     """"Fetch system reading" button: every floor of the caller's building with the
-    system-generated kWh total for `date` (default today), plus any actual meter
-    reading already saved for that floor/date so the form is re-editable."""
+    system-generated kWh total for `date` (default yesterday — today's day isn't
+    over yet), plus any actual meter reading already saved for that floor/date so
+    the form is re-editable."""
     building = _resolve_building(user, building_, allow_default=True)
     if date_:
         try:
@@ -82,7 +95,7 @@ def fetch_system_readings(
         except ValueError:
             raise HTTPException(status_code=400, detail="date must be ISO YYYY-MM-DD")
     else:
-        on = datetime.utcnow().date()
+        on = _default_reading_date()
 
     floors = _building_floors(db, building)
     system = _system_by_floor(db, building, on)
@@ -123,7 +136,7 @@ def submit_readings(
         except ValueError:
             raise HTTPException(status_code=400, detail="reading_date must be ISO YYYY-MM-DD")
     else:
-        on = datetime.utcnow().date()
+        on = _default_reading_date()
 
     system = _system_by_floor(db, building, on)
     existing = {
