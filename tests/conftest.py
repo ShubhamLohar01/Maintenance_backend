@@ -37,9 +37,13 @@ from app.models import (
     MtUtilityGas,
     MtUtilityElectricity,
     MtUtilityWater,
+    MtUtilityRate,
+    MtSparePart,
+    MtSparePartLog,
 )
 
-# RdsBase tables the suite needs (all SQLite-compatible — no JSONB columns).
+# RdsBase tables the suite needs (all SQLite-compatible — no raw JSONB columns;
+# MtSparePart uses PortableJSONB specifically so it can live here too).
 _TABLES = [
     BreakdownRecord,
     BreakdownDoc,
@@ -54,6 +58,9 @@ _TABLES = [
     MtUtilityGas,
     MtUtilityElectricity,
     MtUtilityWater,
+    MtUtilityRate,
+    MtSparePart,
+    MtSparePartLog,
 ]
 
 

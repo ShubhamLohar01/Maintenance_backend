@@ -12,7 +12,7 @@ from .api import (
     auth, machines, energy, breakdowns, floors, mt_machines,
     preventive_maintenance, machine_transfers, breakdown_records,
     live, reports, head, floor_readings, asset_schedules, devices,
-    users, pm_plans, pm_work_orders, mt_users, utilities,
+    users, pm_plans, pm_work_orders, mt_users, utilities, spare_parts,
 )
 
 
@@ -121,6 +121,7 @@ def create_app() -> FastAPI:
     app.include_router(pm_plans.router)
     app.include_router(pm_work_orders.router)
     app.include_router(utilities.router)
+    app.include_router(spare_parts.router)
 
     @app.get("/health", tags=["meta"])
     def health():

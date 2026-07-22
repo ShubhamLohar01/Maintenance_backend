@@ -33,6 +33,7 @@ from ..config import settings
 from .pm_common import (
     require_role, ms_to_naive, resolve_user_name, wo_to_dto, QC_ROLES, next_wo_code,
 )
+from .pm_checklist_sync import sync_wo_to_checklist
 
 router = APIRouter(prefix="/pm", tags=["pm-work-orders"])
 
@@ -143,15 +144,7 @@ def generate_due_work_orders(db: Session) -> int:
                     "order_index": int(it.get("order_index") or 0),
                     "title": str(it.get("title") or ""),
                     "description": str(it.get("description") or ""),
-                    "expected_result": str(it.get("expected_result") or ""),
-                    "requires_photo": bool(it.get("requires_photo")),
-                    "requires_measurement": bool(it.get("requires_measurement")),
-                    "measurement_unit": it.get("measurement_unit"),
-                    "measurement_min": it.get("measurement_min"),
-                    "measurement_max": it.get("measurement_max"),
                     "status": "PENDING",
-                    "measurement_value": None,
-                    "photo_url": None,
                     "notes": None,
                     "completed_at": None,
                     "completed_by": None,
@@ -282,14 +275,15 @@ def submit(
     user: MtUser = Depends(get_current_user),
 ):
     """Technician submits the completed checklist -> SUBMITTED. Replaces task_logs with
-    the submitted array (status/measurement/photo_url/notes) and stores the spares list.
-    Photos are already-uploaded S3 URLs (see POST /pm/photos)."""
+    the submitted array (status = Is-good PASS/FAIL + notes), records the machine-level
+    overall_result (PASS/FAIL), and stores the spares list."""
     require_role(user, {"TECHNICIAN"})
     wo = _get_wo(db, wo_id)
     now = datetime.utcnow()
     wo.task_logs = [tl.model_dump() for tl in req.task_logs]
     wo.spares = [s.model_dump() for s in req.spares]
     wo.final_notes = req.final_notes or None
+    wo.overall_result = (req.overall_result or "").strip().upper() or None
     wo.status = "SUBMITTED"
     wo.submitted_at = ms_to_naive(req.at) or now
     wo.updated_at = now
@@ -411,6 +405,15 @@ def qc_approve(
         if (plan.trigger_type or "TIME").upper() != "USAGE":
             plan.next_due_at = now + timedelta(days=plan.trigger_interval or 0)
         plan.updated_at = now
+
+    # Mirror this verified PM into the controlled 50a/50b checklist document. Best-effort
+    # in a SAVEPOINT so a checklist-sync error can never block the QC close (latest-wins
+    # means the next close for this machine re-syncs its cells anyway).
+    try:
+        with db.begin_nested():
+            sync_wo_to_checklist(db, wo)
+    except Exception:
+        pass
 
     db.commit()
     return wo_to_dto(wo)

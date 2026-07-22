@@ -150,6 +150,7 @@ def wo_to_dto(wo: MtPmWorkOrder) -> PmWorkOrderDto:
         started_at=to_epoch_ms(wo.started_at),
         submitted_at=to_epoch_ms(wo.submitted_at),
         final_notes=wo.final_notes,
+        overall_result=wo.overall_result,
         supervisor_approved_by=wo.supervisor_approved_by,
         supervisor_approved_by_name=wo.supervisor_approved_by_name,
         supervisor_approved_at=to_epoch_ms(wo.supervisor_approved_at),

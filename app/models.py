@@ -3,7 +3,23 @@ from decimal import Decimal
 from sqlalchemy import String, Integer, Float, Boolean, ForeignKey, DateTime, Text, Date, Numeric, UniqueConstraint, CheckConstraint, Index, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.types import TypeDecorator, JSON
 from .database import LocalBase, RdsBase
+
+
+class PortableJSONB(TypeDecorator):
+    """JSONB on Postgres (real RDS); plain JSON on any other dialect (the
+    in-memory SQLite test harness — see tests/conftest.py). Postgres-native
+    JSONB doesn't compile on SQLite at all, which is why other JSONB-backed
+    tables in this file are excluded from that harness; new tables use this
+    instead so they stay testable."""
+    impl = JSON
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "postgresql":
+            return dialect.type_descriptor(JSONB())
+        return dialect.type_descriptor(JSON())
 
 
 class Plant(LocalBase):
@@ -263,6 +279,26 @@ class PreventiveMaintenanceDoc(RdsBase):
     created_at:  Mapped[datetime]       = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class MtPmChecklistLink(RdsBase):
+    """Maps a PM asset to its row in a controlled checklist form (50a/50b), so a
+    QC-closed PM work order can flip that row's cells in the month/quarter document.
+    One row per (asset_id, form_type) — an asset can appear on both the monthly and
+    quarterly form. Seeded best-effort from the asset<->checklist fuzzy match
+    (high-confidence only); `sr_no` pins WHICH form row when equipment repeats."""
+    __tablename__ = "pm_checklist_link"
+
+    id:        Mapped[int]        = mapped_column(Integer, primary_key=True, autoincrement=True)
+    asset_id:  Mapped[str]        = mapped_column(String(32), index=True)          # = mt_asset_list.asset_id
+    form_type: Mapped[str]        = mapped_column(String(16))                      # MONTHLY | QUARTERLY
+    section:   Mapped[str]        = mapped_column(String(255))
+    sr_no:     Mapped[int | None] = mapped_column(Integer, nullable=True)          # the form row this asset fills
+    equipment: Mapped[str]        = mapped_column(String(255))                     # checklist equipment name
+
+    __table_args__ = (
+        UniqueConstraint("asset_id", "form_type", name="uq_pm_link_asset_form"),
+    )
+
+
 class MachineTransfer(RdsBase):
     """One machine-transfer record (between warehouses) with an optional proof
     photo stored in S3 (`proof_photo_url`)."""
@@ -443,6 +479,8 @@ class MtPmWorkOrder(RdsBase):
     started_at:                  Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     submitted_at:                Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     final_notes:                 Mapped[str | None]      = mapped_column(Text, nullable=True)
+    overall_result:              Mapped[str | None]      = mapped_column(String(8), nullable=True)   # machine-level PASS/FAIL (set at submit)
+    checklist_doc_id:            Mapped[int | None]      = mapped_column(Integer, nullable=True)      # doc_preventive_maintenance.id this PM fed (set at QC close)
     supervisor_approved_by:      Mapped[str | None]      = mapped_column(String(128), nullable=True)
     supervisor_approved_by_name: Mapped[str | None]      = mapped_column(String(128), nullable=True)
     supervisor_approved_at:      Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -584,3 +622,53 @@ class MtUtilityWater(RdsBase):
     updated_at:          Mapped[datetime]         = mapped_column(DateTime, server_default=func.now())
 
     __table_args__ = (UniqueConstraint("plant", "reading_date", name="uq_utility_water"),)
+
+
+class MtUtilityRate(RdsBase):
+    """Supervisor-managed current utility prices — one row per plant. The rate
+    stamped onto each mt_utility_* reading is copied from here at submit time
+    (see app/api/utilities.py); a technician submit cannot change it. Only
+    SUPERVISOR/HEAD/ADMIN may edit (PUT /utilities/rates)."""
+    __tablename__ = "mt_utility_rates"
+
+    plant:            Mapped[str]            = mapped_column(String(16), primary_key=True)  # 'A-185' | 'W-202'
+    diesel_rate:      Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    gas_rate:         Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    water_rate:       Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    electricity_rate: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    set_by:           Mapped[str | None]     = mapped_column(String(64), nullable=True)
+    set_at:           Mapped[datetime]       = mapped_column(DateTime, server_default=func.now())
+
+
+# ============================================================================
+# Spare Parts (W-202 only) — pre-existing stock table + a new usage/restock log.
+# machine_name is free text, NOT a foreign key into mt_asset_list (see
+# app/api/spare_parts.py for the best-effort name matching against the asset
+# register). parts_name is a nested {"name", "unit"} blob, as already stored.
+# ============================================================================
+
+class MtSparePart(RdsBase):
+    """Pre-existing spare-parts stock table (one row per machine + part)."""
+    __tablename__ = "mt_202_spareparts"
+
+    id:           Mapped[int]        = mapped_column(Integer, primary_key=True, autoincrement=True)
+    machine_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    parts_name:   Mapped[dict]       = mapped_column(PortableJSONB, nullable=False)   # {"name": ..., "unit": ...}
+    quantity:     Mapped[int]        = mapped_column(Integer, nullable=False)
+
+
+class MtSparePartLog(RdsBase):
+    """Audit trail for every use/restock action — no dedicated UI screen yet,
+    but every quantity change is traceable to a person/time from day one."""
+    __tablename__ = "mt_202_spareparts_log"
+
+    id:                Mapped[int]             = mapped_column(Integer, primary_key=True, autoincrement=True)
+    spare_part_id:     Mapped[int]             = mapped_column(ForeignKey("mt_202_spareparts.id"), nullable=False)
+    machine_name:      Mapped[str | None]      = mapped_column(String(255), nullable=True)   # snapshot
+    part_name:         Mapped[str | None]      = mapped_column(String(255), nullable=True)   # snapshot
+    action:            Mapped[str]             = mapped_column(String(16), nullable=False)   # USE | RESTOCK
+    quantity:          Mapped[int]             = mapped_column(Integer, nullable=False)       # always positive
+    note:              Mapped[str | None]      = mapped_column(Text, nullable=True)
+    performed_by:      Mapped[str | None]      = mapped_column(String(64), nullable=True)
+    performed_by_name: Mapped[str | None]      = mapped_column(String(128), nullable=True)
+    performed_at:      Mapped[datetime]        = mapped_column(DateTime, server_default=func.now())

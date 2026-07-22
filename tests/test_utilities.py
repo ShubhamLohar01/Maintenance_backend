@@ -6,22 +6,24 @@ The app computes the derived values and sends them; the backend upserts on
 from app.models import MtUtilityWater, MtUtilityDiesel
 
 
-def test_water_upsert_stores_inputs_and_computed(auth_client, db_session):
+def test_water_upsert_stores_inputs_and_recomputed(login_as, db_session):
+    login_as(role="SUPERVISOR", location="A-185").put(
+        "/utilities/rates", json={"plant": "A-185", "water_rate": 24})
+    c = login_as(role="TECHNICIAN", location="A-185")
     body = {
         "plant": "A185", "reading_date": "2026-04-01",         # compact plant spelling
         "water_meter_opening": 402.971, "water_meter_closing": 426.86,
-        "water_rate": 24, "production_units": None,
-        "water_consumed": 23.889, "daily_water_cost": 573.34, "cost_per_unit": None,
+        "water_rate": 999, "production_units": None,            # 999 must be ignored
         "remark": "ok",
     }
-    r = auth_client.post("/utilities/water", json=body)
+    r = c.post("/utilities/water", json=body)
     assert r.status_code == 200, r.text
     out = r.json()
-    assert out["plant"] == "A-185"                              # normalized to canonical form
-    assert out["reading_date"] == "2026-04-01"
-    assert out["water_consumed"] == 23.889
-    assert out["daily_water_cost"] == 573.34
-    assert out["cost_per_unit"] is None                         # div-by-zero -> null preserved
+    assert out["plant"] == "A-185"                              # normalized
+    assert out["water_rate"] == 24                              # from config, not 999
+    assert out["water_consumed"] == 23.889                      # 426.86 - 402.971
+    assert round(out["daily_water_cost"], 2) == 573.34          # 23.889 * 24
+    assert out["cost_per_unit"] is None                         # production None -> null
     assert isinstance(out["id"], int)
 
     row = db_session.query(MtUtilityWater).one()
@@ -29,17 +31,19 @@ def test_water_upsert_stores_inputs_and_computed(auth_client, db_session):
     assert float(row.water_consumed) == 23.889
 
 
-def test_upsert_is_idempotent_on_plant_and_date(auth_client, db_session):
-    base = {"plant": "W-202", "reading_date": "2026-04-02", "water_meter_opening": 10,
-            "water_meter_closing": 15, "water_rate": 24, "water_consumed": 5, "daily_water_cost": 120}
-    r1 = auth_client.post("/utilities/water", json=base)
+def test_upsert_is_idempotent_on_plant_and_date(login_as, db_session):
+    login_as(role="SUPERVISOR", location="W-202").put(
+        "/utilities/rates", json={"plant": "W-202", "water_rate": 24})
+    c = login_as(role="TECHNICIAN", location="W-202")
+    base = {"plant": "W-202", "reading_date": "2026-04-02",
+            "water_meter_opening": 10, "water_meter_closing": 15}
+    r1 = c.post("/utilities/water", json=base)
     # same plant+date, corrected reading -> should UPDATE the same row, not insert
-    base2 = {**base, "water_meter_closing": 20, "water_consumed": 10, "daily_water_cost": 240}
-    r2 = auth_client.post("/utilities/water", json=base2)
+    r2 = c.post("/utilities/water", json={**base, "water_meter_closing": 20})
     assert r1.status_code == r2.status_code == 200
     assert r1.json()["id"] == r2.json()["id"]                   # same row
     assert db_session.query(MtUtilityWater).count() == 1
-    assert float(db_session.query(MtUtilityWater).one().daily_water_cost) == 240.0
+    assert float(db_session.query(MtUtilityWater).one().daily_water_cost) == 240.0  # (20-10)*24
 
 
 def test_diesel_upsert_and_list_roundtrip(auth_client, db_session):

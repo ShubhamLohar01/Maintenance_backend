@@ -726,17 +726,15 @@ class UserRosterDto(BaseModel):
 
 # --- Plan: checklist item (JSONB element) ---
 # Every field has a default so a partially-shaped stored item never 500s a read.
+# Simplified checklist (2026-07): an item is just a title + a "Remarks" line (the
+# `description`, was "instruction"). Expected-result, the photo flag, and the whole
+# measurement block were removed; the per-item verdict is the technician's "Is good?"
+# checkbox carried on the task log's `status` (PASS = good, FAIL = not good).
 class PmPlanItemDto(BaseModel):
     id: str = ""
     order_index: int = 0
     title: str = ""
-    description: str = ""
-    expected_result: str = ""
-    requires_photo: bool = False
-    requires_measurement: bool = False
-    measurement_unit: Optional[str] = None
-    measurement_min: Optional[float] = None
-    measurement_max: Optional[float] = None
+    description: str = ""                    # "Remarks" in the editor (supervisor guidance)
 
 
 class PmPlanRequest(_Trimmed):
@@ -798,17 +796,9 @@ class PmTaskLogDto(BaseModel):
     template_item_id: Optional[str] = None
     order_index: int = 0
     title: str = ""
-    description: str = ""
-    expected_result: str = ""
-    requires_photo: bool = False
-    requires_measurement: bool = False
-    measurement_unit: Optional[str] = None
-    measurement_min: Optional[float] = None
-    measurement_max: Optional[float] = None
-    status: str = "PENDING"                 # PENDING | PASS | FAIL | NOT_APPLICABLE
-    measurement_value: Optional[float] = None
-    photo_url: Optional[str] = None         # S3 URL (uploaded via POST /pm/photos)
-    notes: Optional[str] = None
+    description: str = ""                    # "Remarks" guidance snapshot from the plan item
+    status: str = "PENDING"                 # PENDING | PASS (Is good) | FAIL (not good)
+    notes: Optional[str] = None             # technician's remark — required when status = FAIL
     completed_at: Optional[int] = None
     completed_by: Optional[str] = None
 
@@ -829,6 +819,7 @@ class PmWorkOrderDto(BaseModel):
     started_at: Optional[int] = None
     submitted_at: Optional[int] = None
     final_notes: Optional[str] = None
+    overall_result: Optional[str] = None    # machine-level PASS/FAIL chosen on the summary screen
     supervisor_approved_by: Optional[str] = None
     supervisor_approved_by_name: Optional[str] = None
     supervisor_approved_at: Optional[int] = None
@@ -857,6 +848,7 @@ class PmStartRequest(_Trimmed):
 
 class PmSubmitRequest(_Trimmed):
     final_notes: str = ""
+    overall_result: str = ""                # machine-level PASS/FAIL (summary screen)
     at: Optional[int] = None                # submitted_at
     task_logs: List[PmTaskLogDto] = []
     spares: List[PmSpareDto] = []
@@ -1031,3 +1023,106 @@ class UtilityWaterDto(UtilityWaterRequest):
     id: int
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+
+
+class UtilityRatesDto(BaseModel):
+    """Current supervisor-set prices for one plant."""
+    plant: str
+    diesel_rate: Optional[float] = None
+    gas_rate: Optional[float] = None
+    water_rate: Optional[float] = None
+    electricity_rate: Optional[float] = None
+    set_by: Optional[str] = None
+    set_at: Optional[str] = None
+
+
+class UtilityRatesUpdateRequest(BaseModel):
+    """Set one or more rates for a plant. Only the fields present (non-null) are
+    changed; the rest keep their current value."""
+    plant: str
+    diesel_rate: Optional[float] = None
+    gas_rate: Optional[float] = None
+    water_rate: Optional[float] = None
+    electricity_rate: Optional[float] = None
+
+
+class UtilityPrefillDto(BaseModel):
+    """Form pre-fill: opening meter fields copied from the previous reading's
+    closing values, plus the current supervisor rate for the utility. The
+    `openings` keys are the opening fields the target form needs."""
+    plant: str
+    utility: str
+    reading_date: str
+    source_date: Optional[str] = None            # the previous row's date; None if none
+    rate: Optional[float] = None
+    openings: dict
+
+
+# --- Spare Parts (W-202) -----------------------------------------------------
+# mt_202_spareparts is pre-existing (machine_name free text, parts_name JSONB
+# {name, unit}, quantity on hand). matched_assets is a best-effort ILIKE match
+# against mt_asset_list, computed server-side — [] when nothing matches (most
+# machine_name values today have no match; see the design doc).
+
+class MatchedAssetDto(BaseModel):
+    asset_id: str
+    asset_name: str
+
+
+class SparePartDto(BaseModel):
+    id: int
+    part_name: str
+    unit: Optional[str] = None
+    quantity: int
+
+
+class SparePartsMachineDto(BaseModel):
+    machine_name: str   # "" for the legacy machine_name=NULL / "unassigned" bucket
+    matched_assets: List[MatchedAssetDto] = []
+    parts: List[SparePartDto] = []
+
+
+class SparePartsResponse(BaseModel):
+    machines: List[SparePartsMachineDto]
+
+
+class SparePartActionRequest(_Trimmed):
+    """POST /spare-parts/{id}/use or /restock. quantity must be a positive int;
+    `use` additionally 400s if it exceeds the part's current quantity on hand."""
+    quantity: int
+    note: Optional[str] = None
+
+
+# --- Supervisor Reports (Machines Reading / Warehouse-Floor Readings) -------
+# Read-only historical listings, newest first. GET /reports/machines mirrors
+# mt_machine_daily_kwh columns directly (one row per stored record, no
+# aggregation); GET /reports/floor-readings mirrors mt_floor_utility_readings.
+
+class MachineReadingRowDto(BaseModel):
+    reading_date: str                       # ISO YYYY-MM-DD
+    machine_id: str
+    asset_name: str = ""
+    building: Optional[str] = None
+    floor: Optional[str] = None
+    operator_name: Optional[str] = None
+    started_at: Optional[int] = None        # epoch ms; null while a RUN row is still open
+    ended_at: Optional[int] = None          # epoch ms; null while a RUN row is still open
+    status: Optional[str] = None
+    source: Optional[str] = None            # RUN | SCHEDULE
+    daily_kwh: Optional[float] = None
+
+
+class MachinesReadingResponse(BaseModel):
+    rows: List[MachineReadingRowDto]
+
+
+class FloorReadingReportRowDto(BaseModel):
+    reading_date: str                       # ISO YYYY-MM-DD
+    building: str
+    floor: str
+    meter_reading: Optional[float] = None   # actual, technician-entered
+    daily_kwh: Optional[float] = None       # system-computed
+
+
+class FloorReadingsReportResponse(BaseModel):
+    rows: List[FloorReadingReportRowDto]
